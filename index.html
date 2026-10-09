@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <!-- Grundeinstellungen: Zeichensatz und Anpassung an Handy-Bildschirme -->
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <!-- Diese Zeilen erlauben "Zum Home-Bildschirm hinzufügen" wie eine App -->
+  <meta name="theme-color" content="#2b5797">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="Wörterbuch">
+  <title>Wörterbuch</title>
+
+  <!-- ===================== Aussehen (CSS) ===================== -->
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: -apple-system, system-ui, "Segoe UI", Roboto, sans-serif;
+      background: #f2f4f8;
+      color: #222;
+      font-size: 18px;            /* große Schrift für das Handy */
+    }
+    header {
+      background: #2b5797;
+      color: white;
+      padding: 16px;
+      text-align: center;
+    }
+    header h1 { margin: 0; font-size: 1.5em; }
+    main { padding: 16px; max-width: 600px; margin: 0 auto; }
+
+    label { display: block; font-weight: bold; margin: 12px 0 6px; }
+    /* Große Felder und Knopf: gut mit dem Finger zu treffen */
+    select, input, button {
+      width: 100%;
+      font-size: 1.1em;           /* ab 16px zoomt iPhone nicht automatisch */
+      padding: 14px;
+      border-radius: 10px;
+      border: 1px solid #b8c0cc;
+      background: white;
+    }
+    button {
+      margin-top: 16px;
+      background: #2b5797;
+      color: white;
+      border: none;
+      font-weight: bold;
+    }
+    button:disabled { background: #8a9bb8; }
+
+    #ergebnis {
+      margin-top: 20px;
+      background: white;
+      border-radius: 12px;
+      padding: 16px;
+      box-shadow: 0 1px 4px rgba(0,0,0,0.1);
+    }
+    #ergebnis:empty { display: none; }   /* leer = unsichtbar */
+    #ergebnis h2 { margin-top: 0; }
+    .bedeutung { margin: 8px 0; }
+    .wortart { color: #666; font-size: 0.85em; }
+    .beispiel {
+      margin-top: 14px;
+      padding: 10px;
+      background: #eef3fb;
+      border-left: 4px solid #2b5797;
+      border-radius: 6px;
+    }
+    .uebersetzung { color: #555; font-style: italic; margin-top: 4px; }
+    .fehler { color: #b00020; }
+    .hinweis { color: #777; font-size: 0.8em; margin-top: 14px; }
+  </style>
+</head>
+<body>
+  <header><h1>📖 Wörterbuch</h1></header>
+
+  <main>
+    <!-- Das Formular: Sprache wählen, Wort eingeben, Knopf drücken -->
+    <form id="formular">
+      <label for="sprache">Sprache</label>
+      <select id="sprache">
+        <option value="de">Deutsch</option>
+        <option value="en">Englisch</option>
+        <option value="es">Spanisch</option>
+        <option value="fr">Französisch</option>
+      </select>
+
+      <label for="wort">Wort</label>
+      <input id="wort" type="text" placeholder="z. B. Haus"
+             autocomplete="off" autocapitalize="none" spellcheck="false"
+             enterkeyhint="search">
+
+      <button id="knopf" type="submit">Nachschlagen</button>
+    </form>
+
+    <!-- Hier erscheint das Ergebnis -->
+    <div id="ergebnis" aria-live="polite"></div>
+  </main>
+
+  <!-- ===================== Programm (JavaScript) ===================== -->
+  <script>
+    // ---------------------------------------------------------------
+    // Schritt 1: Einstellungen festlegen
+    // ---------------------------------------------------------------
+    const SPRACHEN = { de: "Deutsch", en: "Englisch", es: "Spanisch", fr: "Französisch" };
+    const API_ADRESSE = "https://en.wiktionary.org/api/rest_v1/page/definition/";
+    // Wikimedia möchte wissen, wer anfragt. Im Browser geht das mit "Api-User-Agent".
+    const API_USER_AGENT = "WoerterbuchLernprojekt/1.0 (Web-App, Uebungsprojekt)";
+    const MAX_BEDEUTUNGEN = 3;
+
+    // Eigene Fehlerarten, damit wir passende Meldungen zeigen können
+    class WortNichtGefunden extends Error {}
+    class KeinInternet extends Error {}
+
+    // Elemente der Seite holen, damit wir sie später ändern können
+    const formular = document.getElementById("formular");
+    const spracheFeld = document.getElementById("sprache");
+    const wortFeld = document.getElementById("wort");
+    const knopf = document.getElementById("knopf");
+    const ergebnis = document.getElementById("ergebnis");
+
+    // ---------------------------------------------------------------
+    // Schritt 2: HTML entfernen
+    // Die Antwort enthält HTML (Links, fett usw.). Wir wollen nur Text.
+    // DOMParser liest das HTML, ohne es auszuführen – das ist sicher.
+    // ---------------------------------------------------------------
+    function htmlEntfernen(text) {
+      if (!text) return "";
+      const dokument = new DOMParser().parseFromString(text, "text/html");
+      dokument.querySelectorAll("style, script").forEach(e => e.remove()); // CSS-Code weg
+      return dokument.body.textContent.replace(/\s+/g, " ").trim();
+    }
+
+    // ---------------------------------------------------------------
+    // Schritt 3: Anfrage ins Internet schicken
+    // ---------------------------------------------------------------
+    async function datenHolen(wort) {
+      // encodeURIComponent macht das Wort "adress-tauglich" (ä -> %C3%A4)
+      const adresse = API_ADRESSE + encodeURIComponent(wort);
+      let antwort;
+      try {
+        antwort = await fetch(adresse, { headers: { "Api-User-Agent": API_USER_AGENT } });
+      } catch (e) {
+        // fetch scheitert ganz, wenn keine Verbindung besteht
+        throw new KeinInternet();
+      }
+      if (antwort.status === 404) throw new WortNichtGefunden();
+      if (!antwort.ok) throw new KeinInternet("Server-Fehler " + antwort.status);
+      return await antwort.json();   // Schritt 4: JSON lesen
+    }
+
+    // Groß-/Kleinschreibung: "Haus" und "haus" sind verschiedene Seiten.
+    // Darum probieren wir notfalls auch andere Schreibweisen.
+    async function eintraegeSuchen(wort, sprache) {
+      const gross = wort.charAt(0).toUpperCase() + wort.slice(1).toLowerCase();
+      const varianten = [...new Set([wort, gross, wort.toLowerCase()])]; // ohne doppelte
+      for (const variante of varianten) {
+        try {
+          const daten = await datenHolen(variante);
+          // Die Antwort ist nach Sprachcodes sortiert: { de: [...], en: [...] }
+          if (daten[sprache]) return { gefunden: variante, eintraege: daten[sprache] };
+        } catch (e) {
+          if (!(e instanceof WortNichtGefunden)) throw e; // andere Fehler weitergeben
+        }
+      }
+      throw new WortNichtGefunden();
+    }
+
+    // ---------------------------------------------------------------
+    // Schritt 5: Ergebnis auf der Seite anzeigen
+    // Wir benutzen textContent (nicht innerHTML) – so kann kein
+    // fremder Code in die Seite gelangen.
+    // ---------------------------------------------------------------
+    function neuesElement(tag, klasse, text) {
+      const e = document.createElement(tag);
+      if (klasse) e.className = klasse;
+      if (text) e.textContent = text;
+      return e;
+    }
+
+    function ergebnisZeigen(gefunden, sprache, eintraege) {
+      ergebnis.innerHTML = "";   // altes Ergebnis löschen
+      ergebnis.appendChild(neuesElement("h2", "", gefunden + " (" + SPRACHEN[sprache] + ")"));
+
+      let nummer = 0;
+      let beispiel = null;
+
+      // Jeder Eintrag ist eine Wortart (Noun = Substantiv, Verb, ...)
+      for (const eintrag of eintraege) {
+        for (const definition of (eintrag.definitions || [])) {
+          const bedeutung = htmlEntfernen(definition.definition);
+          if (!bedeutung) continue;            // leere überspringen
+          nummer++;
+          if (nummer <= MAX_BEDEUTUNGEN) {
+            const zeile = neuesElement("div", "bedeutung", nummer + ". " + bedeutung + " ");
+            zeile.appendChild(neuesElement("span", "wortart", "[" + (eintrag.partOfSpeech || "?") + "]"));
+            ergebnis.appendChild(zeile);
+          }
+          // Ersten echten Beispielsatz merken
+          if (!beispiel) {
+            for (const b of (definition.parsedExamples || [])) {
+              const satz = htmlEntfernen(b.example);
+              if (satz) {
+                beispiel = { satz, uebersetzung: htmlEntfernen(b.translation), zu: nummer };
+                break;
+              }
+            }
+          }
+        }
+      }
+
+      if (nummer === 0) ergebnis.appendChild(neuesElement("p", "", "Keine Bedeutung gefunden."));
+      else if (nummer > MAX_BEDEUTUNGEN)
+        ergebnis.appendChild(neuesElement("div", "wortart", "… und " + (nummer - MAX_BEDEUTUNGEN) + " weitere Bedeutungen"));
+
+      const kasten = neuesElement("div", "beispiel");
+      if (beispiel) {
+        kasten.appendChild(neuesElement("div", "", "Beispiel (zu Bedeutung " + beispiel.zu + "): " + beispiel.satz));
+        if (beispiel.uebersetzung)
+          kasten.appendChild(neuesElement("div", "uebersetzung", "Übersetzung: " + beispiel.uebersetzung));
+      } else {
+        // Wichtig: nichts erfinden!
+        kasten.textContent = "Für dieses Wort gibt es im Wörterbuch keinen Beispielsatz.";
+      }
+      ergebnis.appendChild(kasten);
+      ergebnis.appendChild(neuesElement("div", "hinweis", "Quelle: en.wiktionary.org – Bedeutungen auf Englisch"));
+    }
+
+    function meldungZeigen(text, istFehler) {
+      ergebnis.innerHTML = "";
+      ergebnis.appendChild(neuesElement("p", istFehler ? "fehler" : "", text));
+    }
+
+    // ---------------------------------------------------------------
+    // Schritt 6 + 7: Auf den Knopf (oder Enter) reagieren, Fehler behandeln
+    // ---------------------------------------------------------------
+    formular.addEventListener("submit", async (ereignis) => {
+      ereignis.preventDefault();         // Seite nicht neu laden
+      const wort = wortFeld.value.trim();
+      const sprache = spracheFeld.value;
+
+      // Eingabe prüfen
+      if (!wort || wort.length > 100 || /[\/#<>\[\]{}|]/.test(wort)) {
+        meldungZeigen("Bitte ein einzelnes Wort eingeben.", true);
+        return;
+      }
+
+      // Ladezustand anzeigen
+      knopf.disabled = true;
+      knopf.textContent = "Suche …";
+      meldungZeigen("Einen Moment, ich schlage nach …", false);
+
+      try {
+        const { gefunden, eintraege } = await eintraegeSuchen(wort, sprache);
+        ergebnisZeigen(gefunden, sprache, eintraege);
+      } catch (e) {
+        if (e instanceof WortNichtGefunden)
+          meldungZeigen("Das Wort „" + wort + "“ wurde auf " + SPRACHEN[sprache] + " nicht gefunden.", true);
+        else if (e instanceof KeinInternet)
+          meldungZeigen("Keine Verbindung zum Wörterbuch. Bitte Internet prüfen und nochmal versuchen." +
+                        (e.message ? " (" + e.message + ")" : ""), true);
+        else
+          meldungZeigen("Die Antwort des Wörterbuchs konnte nicht gelesen werden.", true);
+      } finally {
+        // Knopf wieder normal machen
+        knopf.disabled = false;
+        knopf.textContent = "Nachschlagen";
+      }
+    });
+
+    // Letzte gewählte Sprache merken (bleibt im Browser gespeichert)
+    spracheFeld.value = localStorage.getItem("sprache") || "de";
+    spracheFeld.addEventListener("change", () => localStorage.setItem("sprache", spracheFeld.value));
+  </script>
+</body>
+</html>
