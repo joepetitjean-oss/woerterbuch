@@ -49,6 +49,17 @@
     }
     button:disabled { background: #8a9bb8; }
 
+    /* Wortfeld und Mikrofon-Knopf nebeneinander */
+    .wortzeile { display: flex; gap: 8px; }
+    .wortzeile input { flex: 1; }
+    #mikro {
+      width: 60px;                /* groß genug für den Daumen */
+      margin-top: 0;
+      font-size: 1.4em;
+      padding: 0;
+    }
+    #mikro.hoert { background: #d32f2f; }   /* rot = hört gerade zu */
+
     #ergebnis {
       margin-top: 20px;
       background: white;
@@ -87,9 +98,15 @@
       </select>
 
       <label for="wort">Wort</label>
-      <input id="wort" type="text" placeholder="z. B. Haus"
-             autocomplete="off" autocapitalize="none" spellcheck="false"
-             enterkeyhint="search">
+      <div class="wortzeile">
+        <!-- autocorrect="off": iPhone soll das Wort nicht "verbessern" -->
+        <input id="wort" type="text" placeholder="z. B. Haus"
+               autocomplete="off" autocapitalize="none" autocorrect="off"
+               spellcheck="false" enterkeyhint="search">
+        <!-- Mikrofon-Knopf für die Spracheingabe -->
+        <button id="mikro" type="button" aria-label="Wort sprechen" title="Wort sprechen">🎤</button>
+      </div>
+      <p id="mikroHinweis" class="hinweis" hidden></p>
 
       <button id="knopf" type="submit">Nachschlagen</button>
     </form>
@@ -105,6 +122,12 @@
     // ---------------------------------------------------------------
     const SPRACHEN = { de: "Deutsch", en: "Englisch", es: "Spanisch", fr: "Französisch" };
     const API_ADRESSE = "https://en.wiktionary.org/api/rest_v1/page/definition/";
+    // Such-Schnittstelle: hilft, wenn der Akzent fehlt (z. B. "cabron" -> "cabrón").
+    // origin=* ist nötig, damit der Browser die Antwort lesen darf.
+    const SUCH_ADRESSE = "https://en.wiktionary.org/w/api.php?action=query&list=search" +
+                         "&srprop=&srlimit=20&format=json&origin=*&srsearch=";
+    // Sprache für die Spracherkennung (passend zur gewählten Sprache)
+    const ERKENNUNGS_SPRACHE = { de: "de-DE", en: "en-US", es: "es-ES", fr: "fr-FR" };
     // Wikimedia möchte wissen, wer anfragt. Im Browser geht das mit "Api-User-Agent".
     const API_USER_AGENT = "WoerterbuchLernprojekt/1.0 (Web-App, Uebungsprojekt)";
     const MAX_BEDEUTUNGEN = 3;
@@ -119,6 +142,29 @@
     const wortFeld = document.getElementById("wort");
     const knopf = document.getElementById("knopf");
     const ergebnis = document.getElementById("ergebnis");
+    const mikroKnopf = document.getElementById("mikro");
+    const mikroHinweis = document.getElementById("mikroHinweis");
+
+    // ---------------------------------------------------------------
+    // Eingabe säubern (wichtig fürs Handy!)
+    // - normalize("NFC"): "o" + Akzent-Zeichen wird zu einem Zeichen "ó"
+    // - unsichtbare Zeichen (z. B. Null-Breite-Leerzeichen) entfernen
+    // - schräge Apostrophe ’ (iPhone) durch normale ' ersetzen
+    // - Satzzeichen und Leerzeichen am Anfang und Ende entfernen
+    // ---------------------------------------------------------------
+    function wortSaeubern(text) {
+      return text
+        .normalize("NFC")
+        .replace(/\p{Cf}/gu, "")                 // unsichtbare Steuerzeichen
+        .replace(/[\u2018\u2019\u02BC]/g, "'")    // ’ ‘ ʼ  ->  '
+        .replace(/^[\s\p{P}]+|[\s\p{P}]+$/gu, "") // Satzzeichen am Rand
+        .replace(/\s+/g, " ");                    // mehrere Leerzeichen -> eins
+    }
+
+    // Akzente entfernen und klein schreiben: "Cabrón" -> "cabron"
+    function ohneAkzente(text) {
+      return text.normalize("NFD").replace(/\p{M}/gu, "").toLowerCase();
+    }
 
     // ---------------------------------------------------------------
     // Schritt 2: HTML entfernen
@@ -155,6 +201,23 @@
     async function eintraegeSuchen(wort, sprache) {
       const gross = wort.charAt(0).toUpperCase() + wort.slice(1).toLowerCase();
       const varianten = [...new Set([wort, gross, wort.toLowerCase()])]; // ohne doppelte
+      const treffer = await variantenProbieren(varianten, sprache);
+      if (treffer) return treffer;
+
+      // Nichts gefunden? Vielleicht fehlt ein Akzent (z. B. "cabron" statt "cabrón").
+      // Wir fragen die Wiktionary-Suche nach ähnlichen Seiten und nehmen nur
+      // die, die OHNE Akzente genau gleich geschrieben werden.
+      const aehnliche = (await aehnlicheSuchen(wort))
+        .filter(titel => !varianten.includes(titel))
+        .slice(0, 4);                         // höchstens 4 weitere Anfragen
+      const treffer2 = await variantenProbieren(aehnliche, sprache);
+      if (treffer2) return treffer2;
+      throw new WortNichtGefunden();
+    }
+
+    // Probiert eine Liste von Schreibweisen nacheinander aus.
+    // Gibt den ersten Treffer in der gewünschten Sprache zurück (oder null).
+    async function variantenProbieren(varianten, sprache) {
       for (const variante of varianten) {
         try {
           const daten = await datenHolen(variante);
@@ -164,7 +227,23 @@
           if (!(e instanceof WortNichtGefunden)) throw e; // andere Fehler weitergeben
         }
       }
-      throw new WortNichtGefunden();
+      return null;
+    }
+
+    // Fragt die Wiktionary-Suche nach Seiten, die bis auf Akzente gleich sind.
+    async function aehnlicheSuchen(wort) {
+      try {
+        const antwort = await fetch(SUCH_ADRESSE + encodeURIComponent(wort),
+                                    { headers: { "Api-User-Agent": API_USER_AGENT } });
+        if (!antwort.ok) return [];
+        const daten = await antwort.json();
+        const ziel = ohneAkzente(wort);
+        return daten.query.search
+          .map(eintrag => eintrag.title)
+          .filter(titel => ohneAkzente(titel) === ziel);
+      } catch (e) {
+        return [];   // Suche ist nur eine Hilfe – bei Problemen einfach weglassen
+      }
     }
 
     // ---------------------------------------------------------------
@@ -179,9 +258,14 @@
       return e;
     }
 
-    function ergebnisZeigen(gefunden, sprache, eintraege) {
+    function ergebnisZeigen(gefunden, sprache, eintraege, eingabe) {
       ergebnis.innerHTML = "";   // altes Ergebnis löschen
       ergebnis.appendChild(neuesElement("h2", "", gefunden + " (" + SPRACHEN[sprache] + ")"));
+      // Wurde das Wort mit Akzent gefunden, obwohl ohne eingegeben? Dann sagen wir das.
+      if (ohneAkzente(gefunden) === ohneAkzente(eingabe) && gefunden.toLowerCase() !== eingabe.toLowerCase()) {
+        ergebnis.appendChild(neuesElement("div", "hinweis",
+          "Eingegeben: „" + eingabe + "“ – gefunden als „" + gefunden + "“"));
+      }
 
       let nummer = 0;
       let beispiel = null;
@@ -237,7 +321,7 @@
     // ---------------------------------------------------------------
     formular.addEventListener("submit", async (ereignis) => {
       ereignis.preventDefault();         // Seite nicht neu laden
-      const wort = wortFeld.value.trim();
+      const wort = wortSaeubern(wortFeld.value);   // Eingabe säubern (siehe oben)
       const sprache = spracheFeld.value;
 
       // Eingabe prüfen
@@ -253,7 +337,7 @@
 
       try {
         const { gefunden, eintraege } = await eintraegeSuchen(wort, sprache);
-        ergebnisZeigen(gefunden, sprache, eintraege);
+        ergebnisZeigen(gefunden, sprache, eintraege, wort);
       } catch (e) {
         if (e instanceof WortNichtGefunden)
           meldungZeigen("Das Wort „" + wort + "“ wurde auf " + SPRACHEN[sprache] + " nicht gefunden.", true);
@@ -268,6 +352,85 @@
         knopf.textContent = "Nachschlagen";
       }
     });
+
+    // ---------------------------------------------------------------
+    // Spracheingabe mit dem Mikrofon (Web Speech API)
+    // Chrome und Safari kennen sie unter verschiedenen Namen.
+    // ---------------------------------------------------------------
+    const Spracherkennung = window.SpeechRecognition || window.webkitSpeechRecognition;
+    let erkennung = null;   // die laufende Erkennung (oder null)
+
+    // Aus dem gesprochenen Satz das erste Wort nehmen
+    function erstesWort(text, sprache) {
+      let wort = wortSaeubern(text).split(" ")[0] || "";
+      wort = wortSaeubern(wort);                    // Satzzeichen weg
+      // Deutsch: Groß-/Kleinschreibung behalten (Nomen wie "Haus")
+      return sprache === "de" ? wort : wort.toLowerCase();
+    }
+
+    function mikroZuruecksetzen() {
+      erkennung = null;
+      mikroKnopf.classList.remove("hoert");
+      mikroKnopf.textContent = "🎤";
+    }
+
+    if (!Spracherkennung) {
+      // Browser kann es nicht -> Knopf verstecken und Tipp zeigen
+      mikroKnopf.hidden = true;
+      mikroHinweis.hidden = false;
+      mikroHinweis.textContent = "Tipp: Zum Sprechen das Mikrofon auf der Handy-Tastatur benutzen.";
+    } else {
+      mikroKnopf.addEventListener("click", () => {
+        // Hört schon zu? Dann beim zweiten Tippen stoppen.
+        if (erkennung) { erkennung.stop(); return; }
+
+        const sprache = spracheFeld.value;
+        erkennung = new Spracherkennung();
+        erkennung.lang = ERKENNUNGS_SPRACHE[sprache];
+        erkennung.interimResults = false;   // nur das Endergebnis
+        erkennung.maxAlternatives = 1;
+
+        erkennung.onstart = () => {
+          mikroKnopf.classList.add("hoert");  // Knopf wird rot
+          mikroKnopf.textContent = "⏹";
+          meldungZeigen("Ich höre zu … bitte ein Wort sagen.", false);
+        };
+
+        erkennung.onresult = (ereignis) => {
+          const gesagt = ereignis.results[0][0].transcript;
+          const wort = erstesWort(gesagt, sprache);
+          if (!wort) { meldungZeigen("Ich habe kein Wort verstanden.", true); return; }
+          wortFeld.value = wort;
+          // Suche automatisch starten (wie ein Druck auf "Nachschlagen")
+          if (formular.requestSubmit) formular.requestSubmit();
+          else formular.dispatchEvent(new Event("submit", { cancelable: true }));
+        };
+
+        erkennung.onerror = (ereignis) => {
+          const meldungen = {
+            "not-allowed": "Das Mikrofon ist nicht erlaubt. Bitte in den Einstellungen erlauben " +
+                           "(iPhone: Diktierfunktion/Siri muss eingeschaltet sein).",
+            "service-not-allowed": "Spracherkennung ist nicht verfügbar. Auf dem iPhone die " +
+                                   "Diktierfunktion einschalten oder das Tastatur-Mikrofon benutzen.",
+            "no-speech": "Ich habe nichts gehört. Bitte nochmal versuchen.",
+            "audio-capture": "Kein Mikrofon gefunden.",
+            "network": "Für die Spracherkennung braucht es Internet.",
+          };
+          if (ereignis.error !== "aborted")
+            meldungZeigen(meldungen[ereignis.error] || "Spracherkennung fehlgeschlagen (" + ereignis.error + ").", true);
+          mikroZuruecksetzen();
+        };
+
+        erkennung.onend = mikroZuruecksetzen;   // fertig -> Knopf wieder normal
+
+        try {
+          erkennung.start();
+        } catch (e) {
+          meldungZeigen("Spracherkennung konnte nicht starten.", true);
+          mikroZuruecksetzen();
+        }
+      });
+    }
 
     // Letzte gewählte Sprache merken (bleibt im Browser gespeichert)
     spracheFeld.value = localStorage.getItem("sprache") || "de";
