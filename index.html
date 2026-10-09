@@ -139,6 +139,10 @@
     const DE_ADRESSE = "https://de.wiktionary.org/w/api.php?action=query&prop=revisions" +
                        "&rvprop=content&rvslots=main&redirects=1&format=json&formatversion=2" +
                        "&origin=*&titles=";
+    // Englisches Wiktionary: ganze Seiten (für die Übersetzungstabellen)
+    const EN_SEITEN_ADRESSE = "https://en.wiktionary.org/w/api.php?action=query&prop=revisions" +
+                              "&rvprop=content&rvslots=main&redirects=1&format=json&formatversion=2" +
+                              "&origin=*&titles=";
     // Notlösung, wenn das deutsche Wiktionary nichts hat: maschinelle Übersetzung
     const MT_ADRESSE = "https://api.mymemory.translated.net/get?langpair=";
     // Sprache für die Spracherkennung (passend zur gewählten Sprache)
@@ -211,12 +215,69 @@
       return await antwort.json();   // Schritt 4: JSON lesen
     }
 
+    // ---------------------------------------------------------------
+    // Artikel am Anfang entfernen ("la maison" -> "maison")
+    // Leute tippen oft den Artikel mit. Wiktionary kennt aber nur "maison".
+    // Längere Artikel zuerst, damit "de la" vor "de" geprüft wird.
+    // ---------------------------------------------------------------
+    const ARTIKEL = {
+      fr: ["de la", "de l'", "les", "le", "la", "l'", "une", "un", "des", "du"],
+      es: ["los", "las", "el", "la", "unos", "unas", "una", "un"],
+      de: ["der", "die", "das", "den", "dem", "des", "einen", "einem", "einer", "eine", "ein"],
+      en: ["the", "an", "a", "to"],   // "to" für Verben: "to eat" -> "eat"
+    };
+
+    function artikelEntfernen(text, sprache) {
+      const klein = text.toLowerCase();
+      for (const artikel of ARTIKEL[sprache]) {
+        // "l'" hängt direkt am Wort ("l'eau"), die anderen haben ein Leerzeichen danach
+        const mitAbstand = artikel.endsWith("'") ? artikel : artikel + " ";
+        if (klein.startsWith(mitAbstand) && text.length > mitAbstand.length) {
+          return text.slice(mitAbstand.length).trim();
+        }
+      }
+      return text;   // kein Artikel gefunden (oder nur der Artikel allein eingegeben)
+    }
+
+    // ---------------------------------------------------------------
+    // "Form von": Wiktionary sagt bei "maisons" nur "plural of maison".
+    // Dann holen wir lieber den Grundeintrag ("maison").
+    // ---------------------------------------------------------------
+
+    // Gibt die Grundform zurück, wenn die ERSTE Bedeutung nur "Form von ..." ist
+    // (sonst null). Einträge wie "Symbol" (z. B. Sprachcodes) zählen nicht mit.
+    function grundformFinden(eintraege) {
+      for (const eintrag of eintraege) {
+        if (eintrag.partOfSpeech === "Symbol") continue;
+        for (const definition of (eintrag.definitions || [])) {
+          const html = definition.definition || "";
+          if (!htmlEntfernen(html)) continue;                     // leere überspringen
+          if (!html.includes("form-of-definition")) return null;  // echte Bedeutung
+          // Den Link zur Grundform lesen: <a href="/wiki/maison#French">
+          const dokument = new DOMParser().parseFromString(html, "text/html");
+          const link = dokument.querySelector(".form-of-definition-link a");
+          if (!link) return null;
+          const ziel = (link.getAttribute("href") || "").split("/wiki/")[1] || "";
+          const grundform = decodeURIComponent(ziel.split("#")[0]).replace(/_/g, " ");
+          return grundform ? { grundform, beschreibung: htmlEntfernen(html) } : null;
+        }
+      }
+      return null;
+    }
+
     // Groß-/Kleinschreibung: "Haus" und "haus" sind verschiedene Seiten.
     // Darum probieren wir notfalls auch andere Schreibweisen.
     async function eintraegeSuchen(wort, sprache) {
       const gross = wort.charAt(0).toUpperCase() + wort.slice(1).toLowerCase();
-      const varianten = [...new Set([wort, gross, wort.toLowerCase()])]; // ohne doppelte
-      const treffer = await variantenProbieren(varianten, sprache);
+      // Deutsch: Nomen werden groß geschrieben -> Großschreibung gleich mitprobieren.
+      // Andere Sprachen: zuerst wie eingegeben und klein ("House" -> "house"),
+      // groß nur als Notlösung (sonst wird "ate" zur Göttin "Ate").
+      const varianten = sprache === "de"
+        ? [...new Set([wort, gross, wort.toLowerCase()])]     // ohne doppelte
+        : [...new Set([wort, wort.toLowerCase()])];
+      const treffer = await variantenProbieren(varianten, sprache)
+                   || (sprache !== "de" && !varianten.includes(gross)
+                       ? await variantenProbieren([gross], sprache) : null);
       if (treffer) return treffer;
 
       // Nichts gefunden? Vielleicht fehlt ein Akzent (z. B. "cabron" statt "cabrón").
@@ -227,22 +288,32 @@
         .slice(0, 4);                         // höchstens 4 weitere Anfragen
       const treffer2 = await variantenProbieren(aehnliche, sprache);
       if (treffer2) return treffer2;
-      throw new WortNichtGefunden();
+      return null;
     }
 
     // Probiert eine Liste von Schreibweisen nacheinander aus.
     // Gibt den ersten Treffer in der gewünschten Sprache zurück (oder null).
+    // Beispiel: "haus" ist nur eine Verbform von "hausen" – das Nomen "Haus"
+    // ist meistens gemeint. Darum suchen wir weiter, wenn der erste Treffer
+    // nur eine "Form von" ist, und nehmen ihn nur, wenn sonst nichts passt.
     async function variantenProbieren(varianten, sprache) {
+      let nurForm = null;
       for (const variante of varianten) {
         try {
           const daten = await datenHolen(variante);
           // Die Antwort ist nach Sprachcodes sortiert: { de: [...], en: [...] }
-          if (daten[sprache]) return { gefunden: variante, eintraege: daten[sprache] };
+          if (!daten[sprache]) continue;
+          const treffer = { gefunden: variante, eintraege: daten[sprache] };
+          if (grundformFinden(treffer.eintraege)) {
+            if (!nurForm) nurForm = treffer;  // merken, aber weitersuchen
+            continue;
+          }
+          return treffer;
         } catch (e) {
           if (!(e instanceof WortNichtGefunden)) throw e; // andere Fehler weitergeben
         }
       }
-      return null;
+      return nurForm;
     }
 
     // Fragt die Wiktionary-Suche nach Seiten, die bis auf Akzente gleich sind.
@@ -262,6 +333,62 @@
     }
 
     // ---------------------------------------------------------------
+    // Die ganze Suche: Artikel weg, Wortgruppe, einzelne Wörter, Grundform
+    // Gibt zurück: { gefunden, eintraege, hinweise: [...] }
+    // ---------------------------------------------------------------
+    async function nachschlagen(eingabe, sprache) {
+      const hinweise = [];
+      const gesucht = artikelEntfernen(eingabe, sprache);
+
+      // Reihenfolge der Versuche:
+      // 1. ohne Artikel ("maison"), 2. so wie eingegeben,
+      // 3. bei mehreren Wörtern: jedes Wort einzeln (ohne Artikel)
+      const versuche = [gesucht, eingabe];
+      const woerter = gesucht.split(" ");
+      if (woerter.length > 1) {
+        for (const w of woerter.slice(0, 3)) {
+          const ohne = artikelEntfernen(w, sprache);
+          if (!ARTIKEL[sprache].includes(ohne.toLowerCase())) versuche.push(ohne);
+        }
+      }
+
+      let treffer = null;
+      let versuch = "";
+      for (versuch of [...new Set(versuche)]) {
+        treffer = await eintraegeSuchen(versuch, sprache);
+        if (treffer) break;
+      }
+      if (!treffer) throw new WortNichtGefunden();
+
+      // Hinweise sammeln, damit klar ist, was wirklich gesucht wurde
+      if (versuch !== eingabe) {
+        if (woerter.length > 1 && versuch !== gesucht)
+          hinweise.push("Die Wortgruppe „" + gesucht + "“ gibt es nicht – gezeigt wird „" + versuch + "“.");
+        else
+          hinweise.push("Eingegeben: „" + eingabe + "“ – gesucht: „" + versuch + "“");
+      }
+      if (ohneAkzente(treffer.gefunden) === ohneAkzente(versuch) &&
+          treffer.gefunden.toLowerCase() !== versuch.toLowerCase())
+        hinweise.push("Eingegeben: „" + versuch + "“ – gefunden als „" + treffer.gefunden + "“");
+
+      // Ist es nur eine Form (Mehrzahl, Verbform)? Dann die Grundform holen.
+      const form = grundformFinden(treffer.eintraege);
+      if (form) {
+        try {
+          const daten = await datenHolen(form.grundform);
+          if (daten[sprache]) {
+            hinweise.push("„" + treffer.gefunden + "“ ist eine Form von „" + form.grundform +
+                          "“ (" + form.beschreibung + ")");
+            return { gefunden: form.grundform, eintraege: daten[sprache], hinweise };
+          }
+        } catch (e) {
+          if (!(e instanceof WortNichtGefunden)) throw e;
+        }
+      }
+      return { gefunden: treffer.gefunden, eintraege: treffer.eintraege, hinweise };
+    }
+
+    // ---------------------------------------------------------------
     // Schritt 5: Ergebnis auf der Seite anzeigen
     // Wir benutzen textContent (nicht innerHTML) – so kann kein
     // fremder Code in die Seite gelangen.
@@ -273,20 +400,19 @@
       return e;
     }
 
-    function ergebnisZeigen(gefunden, sprache, eintraege, eingabe) {
+    function ergebnisZeigen(gefunden, sprache, eintraege, hinweise) {
       ergebnis.innerHTML = "";   // altes Ergebnis löschen
       ergebnis.appendChild(neuesElement("h2", "", gefunden + " (" + SPRACHEN[sprache] + ")"));
-      // Wurde das Wort mit Akzent gefunden, obwohl ohne eingegeben? Dann sagen wir das.
-      if (ohneAkzente(gefunden) === ohneAkzente(eingabe) && gefunden.toLowerCase() !== eingabe.toLowerCase()) {
-        ergebnis.appendChild(neuesElement("div", "hinweis",
-          "Eingegeben: „" + eingabe + "“ – gefunden als „" + gefunden + "“"));
-      }
+      // Hinweise, z. B. "Eingegeben: „la maison“ – gesucht: „maison“"
+      for (const text of hinweise) ergebnis.appendChild(neuesElement("div", "hinweis", text));
 
       let nummer = 0;
       let beispiel = null;
 
       // Jeder Eintrag ist eine Wortart (Noun = Substantiv, Verb, ...)
       for (const eintrag of eintraege) {
+        // "Symbol" sind z. B. Sprachcodes ("cat" = Katalanisch) – für Lernende unnütz
+        if (eintrag.partOfSpeech === "Symbol") continue;
         for (const definition of (eintrag.definitions || [])) {
           const bedeutung = htmlEntfernen(definition.definition);
           if (!bedeutung) continue;            // leere überspringen
@@ -366,6 +492,7 @@
         if (zeile.startsWith("{{Bedeutungen}}")) { inBedeutungen = true; continue; }
         if (inBedeutungen) {
           if (zeile.startsWith("::")) continue;          // Unterpunkte überspringen
+          if (zeile.startsWith("*")) continue;           // Gruppen wie "*{{K|intrans.}}" überspringen
           if (zeile.startsWith(":")) {
             // ":[1] das Haus" -> "das Haus"
             const text = wikiTextSaeubern(zeile.replace(/^:\s*(\[[^\]]*\])?/, ""));
@@ -403,6 +530,79 @@
       return null;
     }
 
+    // ---------------------------------------------------------------
+    // Zweite Quelle für Deutsch: die Übersetzungstabellen im englischen
+    // Wiktionary. Dort steht z. B. bei "possibility":
+    //   * German: {{t+|de|Möglichkeit|f}}
+    // Für ein französisches Wort nehmen wir seine englische Bedeutung
+    // ("possibilité" -> "possibility") und schauen dort nach.
+    // ---------------------------------------------------------------
+
+    // Aus den englischen Bedeutungen ein kurzes Stichwort machen:
+    // "(transitive) to eat, to dine" -> "eat"
+    function englischesStichwort(eintraege) {
+      for (const eintrag of eintraege) {
+        for (const definition of (eintrag.definitions || [])) {
+          const html = definition.definition || "";
+          if (html.includes("form-of-definition")) continue;   // "plural of ..." überspringen
+          let text = htmlEntfernen(html).replace(/\([^)]*\)/g, " ");  // Klammern weg
+          text = text.split(/[,;:.]/)[0].trim();
+          text = text.replace(/^(to|a|an|the)\s+/i, "").trim();
+          if (text && text.split(" ").length <= 3) return text;
+          if (text) return null;   // erste Bedeutung ist ein langer Satz -> kein Stichwort
+        }
+      }
+      return null;
+    }
+
+    const ARTIKEL_DE = { m: "der", f: "die", n: "das", p: "die" };
+
+    // Liest aus dem Wiki-Text die deutschen Wörter der ersten passenden Tabelle
+    function deutscheUebersetzungen(wikitext) {
+      let sinn = "";
+      let ungeprueft = false;
+      for (const zeile of wikitext.split("\n")) {
+        const kopf = zeile.match(/\{\{(trans-top|checktrans-top)[^|}]*\|?([^|}]*)/);
+        if (kopf) {
+          // Neue Tabelle beginnt; "checktrans" = noch nicht geprüft -> überspringen
+          ungeprueft = kopf[1] === "checktrans-top";
+          sinn = wikiTextSaeubern(kopf[2] || "");
+          continue;
+        }
+        if (ungeprueft || !/^\*\s*German\s*:/.test(zeile)) continue;
+        // {{t+|de|Möglichkeit|f}}  (auch t, tt, tt+)
+        const woerter = [];
+        for (const m of zeile.matchAll(/\{\{tt?\+?\|de\|([^|}]+)(?:\|([mfnp]))?/g)) {
+          const wort = m[1].trim();
+          woerter.push(m[2] ? ARTIKEL_DE[m[2]] + " " + wort : wort);
+        }
+        if (woerter.length) return { woerter: [...new Set(woerter)].slice(0, 4), sinn };
+      }
+      return null;
+    }
+
+    async function deutschUeberEnglisch(stichwort) {
+      // Manche Seiten haben die Tabelle auf einer Unterseite ("water/translations").
+      // Wir fragen beide Seiten auf einmal ab.
+      const titel = [stichwort + "/translations", stichwort];
+      const adresse = EN_SEITEN_ADRESSE + encodeURIComponent(titel.join("|"));
+      const antwort = await fetch(adresse, { headers: { "Api-User-Agent": API_USER_AGENT } });
+      if (!antwort.ok) return null;
+      const daten = await antwort.json();
+      const seiten = {};
+      for (const seite of (daten.query && daten.query.pages) || []) {
+        if (!seite.missing && seite.revisions) seiten[seite.title] = seite.revisions[0].slots.main.content;
+      }
+      for (const t of titel) {
+        if (!seiten[t]) continue;
+        // Nur den englischen Teil der Seite nehmen (bis zur nächsten Sprache)
+        const englisch = (seiten[t].split(/^==English==\s*$/m)[1] || seiten[t]).split(/^==[^=]/m)[0];
+        const ergebnis = deutscheUebersetzungen(englisch);
+        if (ergebnis) return { ...ergebnis, seite: stichwort };
+      }
+      return null;
+    }
+
     // Notlösung: maschinelle Übersetzung (MyMemory, kostenlos, ohne Schlüssel)
     async function maschinellUebersetzen(wort, sprache) {
       const adresse = MT_ADRESSE + sprache + "|de&q=" + encodeURIComponent(wort);
@@ -417,7 +617,7 @@
     }
 
     // Baut den Abschnitt "Auf Deutsch" unter das Ergebnis
-    async function deutschZeigen(gefunden, eingabe, sprache) {
+    async function deutschZeigen(gefunden, eingabe, sprache, eintraege) {
       const kasten = neuesElement("div", "deutsch");
       // Bei deutschen Wörtern gibt es keine Übersetzung, sondern die Bedeutung
       kasten.appendChild(neuesElement("h3", "", sprache === "de" ? "Bedeutung auf Deutsch" : "Auf Deutsch"));
@@ -444,7 +644,22 @@
           quelle.textContent = "Quelle: de.wiktionary.org (Eintrag „" + treffer.titel + "“)";
           return;
         }
-        // Nichts im deutschen Wiktionary: bei Fremdsprachen maschinell übersetzen
+        // Zweite Quelle: Übersetzungstabelle im englischen Wiktionary.
+        // Englische Wörter direkt, andere über ihre englische Bedeutung.
+        if (sprache !== "de") {
+          const stichwort = sprache === "en" ? gefunden : englischesStichwort(eintraege);
+          const tabelle = stichwort ? await deutschUeberEnglisch(stichwort) : null;
+          if (tabelle) {
+            inhalt.textContent = tabelle.woerter.join(", ");
+            if (tabelle.sinn) inhalt.appendChild(neuesElement("div", "wortart", "im Sinne von: " + tabelle.sinn));
+            quelle.textContent = sprache === "en"
+              ? "Quelle: en.wiktionary.org – Übersetzungstabelle von „" + tabelle.seite + "“"
+              : "Quelle: en.wiktionary.org – Übersetzungstabelle von „" + tabelle.seite +
+                "“ (indirekt über die englische Bedeutung)";
+            return;
+          }
+        }
+        // Nichts gefunden: bei Fremdsprachen maschinell übersetzen
         if (sprache !== "de") {
           const mt = await maschinellUebersetzen(gefunden, sprache);
           if (mt) {
@@ -477,7 +692,7 @@
 
       // Eingabe prüfen
       if (!wort || wort.length > 100 || /[\/#<>\[\]{}|]/.test(wort)) {
-        meldungZeigen("Bitte ein einzelnes Wort eingeben.", true);
+        meldungZeigen("Bitte ein Wort (oder eine kurze Wortgruppe) eingeben.", true);
         return;
       }
 
@@ -487,9 +702,9 @@
       meldungZeigen("Einen Moment, ich schlage nach …", false);
 
       try {
-        const { gefunden, eintraege } = await eintraegeSuchen(wort, sprache);
-        ergebnisZeigen(gefunden, sprache, eintraege, wort);
-        await deutschZeigen(gefunden, wort, sprache);   // Abschnitt "Auf Deutsch"
+        const { gefunden, eintraege, hinweise } = await nachschlagen(wort, sprache);
+        ergebnisZeigen(gefunden, sprache, eintraege, hinweise);
+        await deutschZeigen(gefunden, wort, sprache, eintraege);   // Abschnitt "Auf Deutsch"
       } catch (e) {
         if (e instanceof WortNichtGefunden)
           meldungZeigen("Das Wort „" + wort + "“ wurde auf " + SPRACHEN[sprache] + " nicht gefunden.", true);
@@ -512,9 +727,10 @@
     const Spracherkennung = window.SpeechRecognition || window.webkitSpeechRecognition;
     let erkennung = null;   // die laufende Erkennung (oder null)
 
-    // Aus dem gesprochenen Satz das erste Wort nehmen
+    // Aus dem Gesprochenen höchstens 3 Wörter nehmen (z. B. "la maison").
+    // Den Artikel entfernt später die Suche.
     function erstesWort(text, sprache) {
-      let wort = wortSaeubern(text).split(" ")[0] || "";
+      let wort = wortSaeubern(text).split(" ").slice(0, 3).join(" ");
       wort = wortSaeubern(wort);                    // Satzzeichen weg
       // Deutsch: Groß-/Kleinschreibung behalten (Nomen wie "Haus")
       return sprache === "de" ? wort : wort.toLowerCase();
