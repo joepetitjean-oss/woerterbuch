@@ -80,6 +80,15 @@
     }
     .uebersetzung { color: #555; font-style: italic; margin-top: 4px; }
     .fehler { color: #b00020; }
+    /* Abschnitt "Auf Deutsch" (gelblicher Kasten) */
+    .deutsch {
+      margin-top: 16px;
+      padding: 10px;
+      background: #fdf6e3;
+      border-left: 4px solid #e0a800;
+      border-radius: 6px;
+    }
+    .deutsch h3 { margin: 0 0 6px; font-size: 1em; }
     .hinweis { color: #777; font-size: 0.8em; margin-top: 14px; }
   </style>
 </head>
@@ -126,6 +135,12 @@
     // origin=* ist nötig, damit der Browser die Antwort lesen darf.
     const SUCH_ADRESSE = "https://en.wiktionary.org/w/api.php?action=query&list=search" +
                          "&srprop=&srlimit=20&format=json&origin=*&srsearch=";
+    // Deutsches Wiktionary: hier stehen die deutschen Übersetzungen/Bedeutungen
+    const DE_ADRESSE = "https://de.wiktionary.org/w/api.php?action=query&prop=revisions" +
+                       "&rvprop=content&rvslots=main&redirects=1&format=json&formatversion=2" +
+                       "&origin=*&titles=";
+    // Notlösung, wenn das deutsche Wiktionary nichts hat: maschinelle Übersetzung
+    const MT_ADRESSE = "https://api.mymemory.translated.net/get?langpair=";
     // Sprache für die Spracherkennung (passend zur gewählten Sprache)
     const ERKENNUNGS_SPRACHE = { de: "de-DE", en: "en-US", es: "es-ES", fr: "fr-FR" };
     // Wikimedia möchte wissen, wer anfragt. Im Browser geht das mit "Api-User-Agent".
@@ -311,6 +326,142 @@
       ergebnis.appendChild(neuesElement("div", "hinweis", "Quelle: en.wiktionary.org – Bedeutungen auf Englisch"));
     }
 
+    // ---------------------------------------------------------------
+    // Abschnitt "Auf Deutsch"
+    // ---------------------------------------------------------------
+
+    // Wiki-Schreibweise in normalen Text umwandeln, z. B.
+    // "das [[Haus]], {{K|ugs.}} [[Bude|die Bude]]"  ->  "das Haus, ugs.: die Bude"
+    function wikiTextSaeubern(zeile) {
+      let z = zeile;
+      z = z.replace(/<ref[^>]*\/>/g, "");                 // Quellen-Hinweise weg
+      z = z.replace(/<ref[^>]*>[\s\S]*?<\/ref>/g, "");
+      // {{K|ugs.|scherzhaft}} -> "ugs., scherzhaft:"  (K = Kennzeichnung)
+      z = z.replace(/\{\{K\|([^{}]*)\}\}/g, (_, inhalt) =>
+        inhalt.split("|").filter(teil => !teil.includes("=")).join(", ") + ":");
+      // alle anderen {{Vorlagen}} entfernen (von innen nach außen)
+      while (/\{\{[^{}]*\}\}/.test(z)) z = z.replace(/\{\{[^{}]*\}\}/g, "");
+      // [[Ziel|Text]] -> Text   und   [[Wort]] -> Wort
+      z = z.replace(/\[\[(?:[^\]|]*\|)?([^\]]*)\]\]/g, "$1");
+      z = z.replace(/'{2,}/g, "");                        // Kursiv- und Fett-Zeichen ('' und ''')
+      z = z.replace(/<[^>]+>/g, "");                      // restliches HTML
+      return z.replace(/\s+/g, " ").trim();
+    }
+
+    // Sucht im Wiki-Text den Abschnitt der richtigen Sprache,
+    // z. B. "== casa ({{Sprache|Spanisch}}) ==", und darin die Zeilen
+    // unter {{Bedeutungen}} (":[1] das Haus").
+    function bedeutungenAusWikitext(wikitext, sprachName) {
+      const zeilen = [];
+      let richtigeSprache = false;
+      let inBedeutungen = false;
+      for (const zeile of wikitext.split("\n")) {
+        const ueberschrift = zeile.match(/^==[^=].*\{\{Sprache\|([^}|]+)/);
+        if (ueberschrift) {                  // neue Sprache beginnt
+          richtigeSprache = (ueberschrift[1].trim() === sprachName);
+          inBedeutungen = false;
+          continue;
+        }
+        if (!richtigeSprache) continue;
+        if (zeile.startsWith("{{Bedeutungen}}")) { inBedeutungen = true; continue; }
+        if (inBedeutungen) {
+          if (zeile.startsWith("::")) continue;          // Unterpunkte überspringen
+          if (zeile.startsWith(":")) {
+            // ":[1] das Haus" -> "das Haus"
+            const text = wikiTextSaeubern(zeile.replace(/^:\s*(\[[^\]]*\])?/, ""));
+            if (text) zeilen.push(text);
+          } else {
+            inBedeutungen = false;           // Block ist zu Ende
+          }
+        }
+      }
+      return zeilen;
+    }
+
+    // Holt aus dem deutschen Wiktionary die deutschen Bedeutungen.
+    // Wir fragen mehrere Schreibweisen auf einmal an (mit | getrennt).
+    async function deutschAusWiktionary(varianten, sprache) {
+      const adresse = DE_ADRESSE + encodeURIComponent(varianten.join("|"));
+      const antwort = await fetch(adresse, { headers: { "Api-User-Agent": API_USER_AGENT } });
+      if (!antwort.ok) return null;
+      const daten = await antwort.json();
+      const abfrage = daten.query || {};
+      // Seiten nach Titel ablegen, damit wir die Reihenfolge der Varianten einhalten
+      const seiten = {};
+      for (const seite of abfrage.pages || []) {
+        if (!seite.missing && seite.revisions) seiten[seite.title] = seite.revisions[0].slots.main.content;
+      }
+      // Umbenennungen berücksichtigen (Weiterleitung oder Unicode-Normalisierung)
+      for (const w of [...(abfrage.normalized || []), ...(abfrage.redirects || [])]) {
+        if (seiten[w.to]) seiten[w.from] = seiten[w.to];
+      }
+      for (const titel of varianten) {
+        if (!seiten[titel]) continue;
+        const zeilen = bedeutungenAusWikitext(seiten[titel], SPRACHEN[sprache]);
+        if (zeilen.length) return { titel, zeilen };
+      }
+      return null;
+    }
+
+    // Notlösung: maschinelle Übersetzung (MyMemory, kostenlos, ohne Schlüssel)
+    async function maschinellUebersetzen(wort, sprache) {
+      const adresse = MT_ADRESSE + sprache + "|de&q=" + encodeURIComponent(wort);
+      const antwort = await fetch(adresse);
+      if (!antwort.ok) return null;
+      const daten = await antwort.json();
+      if (daten.responseStatus !== 200 || daten.quotaFinished) return null;
+      const text = htmlEntfernen(daten.responseData && daten.responseData.translatedText);
+      // Kam das Wort unverändert zurück? Dann ist es keine echte Übersetzung.
+      if (!text || text.toLowerCase() === wort.toLowerCase()) return null;
+      return text;
+    }
+
+    // Baut den Abschnitt "Auf Deutsch" unter das Ergebnis
+    async function deutschZeigen(gefunden, eingabe, sprache) {
+      const kasten = neuesElement("div", "deutsch");
+      // Bei deutschen Wörtern gibt es keine Übersetzung, sondern die Bedeutung
+      kasten.appendChild(neuesElement("h3", "", sprache === "de" ? "Bedeutung auf Deutsch" : "Auf Deutsch"));
+      const inhalt = neuesElement("div", "", "Lädt …");
+      kasten.appendChild(inhalt);
+      const quelle = neuesElement("div", "hinweis", "");
+      kasten.appendChild(quelle);
+      // Vor den Quellen-Hinweis des Hauptergebnisses (letzte Zeile) einfügen
+      ergebnis.insertBefore(kasten, ergebnis.lastChild);
+
+      // Schreibweisen: gefundenes Wort, Eingabe, groß, klein (ohne doppelte)
+      const gross = gefunden.charAt(0).toUpperCase() + gefunden.slice(1);
+      const varianten = [...new Set([gefunden, eingabe, gross, gefunden.toLowerCase()])];
+
+      try {
+        const treffer = await deutschAusWiktionary(varianten, sprache);
+        if (treffer) {
+          inhalt.textContent = "";
+          treffer.zeilen.slice(0, MAX_BEDEUTUNGEN).forEach((text, i) =>
+            inhalt.appendChild(neuesElement("div", "bedeutung", (i + 1) + ". " + text)));
+          if (treffer.zeilen.length > MAX_BEDEUTUNGEN)
+            inhalt.appendChild(neuesElement("div", "wortart",
+              "… und " + (treffer.zeilen.length - MAX_BEDEUTUNGEN) + " weitere"));
+          quelle.textContent = "Quelle: de.wiktionary.org (Eintrag „" + treffer.titel + "“)";
+          return;
+        }
+        // Nichts im deutschen Wiktionary: bei Fremdsprachen maschinell übersetzen
+        if (sprache !== "de") {
+          const mt = await maschinellUebersetzen(gefunden, sprache);
+          if (mt) {
+            inhalt.textContent = mt;
+            quelle.textContent = "Maschinelle Übersetzung (MyMemory) – kann ungenau sein";
+            return;
+          }
+        }
+        // Wichtig: nichts erfinden!
+        inhalt.textContent = sprache === "de"
+          ? "Keine deutsche Bedeutung gefunden."
+          : "Keine deutsche Übersetzung gefunden.";
+      } catch (e) {
+        inhalt.textContent = "Der deutsche Teil konnte nicht geladen werden (Internet?).";
+      }
+    }
+
     function meldungZeigen(text, istFehler) {
       ergebnis.innerHTML = "";
       ergebnis.appendChild(neuesElement("p", istFehler ? "fehler" : "", text));
@@ -338,6 +489,7 @@
       try {
         const { gefunden, eintraege } = await eintraegeSuchen(wort, sprache);
         ergebnisZeigen(gefunden, sprache, eintraege, wort);
+        await deutschZeigen(gefunden, wort, sprache);   // Abschnitt "Auf Deutsch"
       } catch (e) {
         if (e instanceof WortNichtGefunden)
           meldungZeigen("Das Wort „" + wort + "“ wurde auf " + SPRACHEN[sprache] + " nicht gefunden.", true);
