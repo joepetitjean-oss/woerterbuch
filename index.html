@@ -88,7 +88,11 @@
       border-left: 4px solid #e0a800;
       border-radius: 6px;
     }
-    .deutsch h3 { margin: 0 0 6px; font-size: 1em; }
+    .deutsch h3, .beispiel h3 { margin: 0 0 6px; font-size: 1em; }
+    #ergebnis h2 { margin-bottom: 2px; }
+    /* Klappbereich "Englische Erklärung anzeigen" */
+    details { margin-top: 14px; font-size: 0.9em; color: #444; }
+    summary { cursor: pointer; color: #2b5797; padding: 8px 0; }
     .hinweis { color: #777; font-size: 0.8em; margin-top: 14px; }
   </style>
 </head>
@@ -259,7 +263,7 @@
           if (!link) return null;
           const ziel = (link.getAttribute("href") || "").split("/wiki/")[1] || "";
           const grundform = decodeURIComponent(ziel.split("#")[0]).replace(/_/g, " ");
-          return grundform ? { grundform, beschreibung: htmlEntfernen(html) } : null;
+          return grundform ? { grundform, beschreibung: formAufDeutsch(htmlEntfernen(html)) } : null;
         }
       }
       return null;
@@ -336,6 +340,21 @@
     // Die ganze Suche: Artikel weg, Wortgruppe, einzelne Wörter, Grundform
     // Gibt zurück: { gefunden, eintraege, hinweise: [...] }
     // ---------------------------------------------------------------
+    // Beschreibt eine Wortform auf Deutsch ("plural of maison" -> "Mehrzahl").
+    // Die englische Beschreibung zeigen wir nicht – alles soll Deutsch sein.
+    function formAufDeutsch(englisch) {
+      const t = englisch.toLowerCase();
+      const teile = [];
+      if (t.includes("feminine")) teile.push("weibliche Form");
+      if (t.includes("plural")) teile.push("Mehrzahl");
+      if (t.includes("past participle")) teile.push("Partizip Perfekt");
+      else if (t.includes("present participle") || t.includes("gerund")) teile.push("Verlaufsform (Gerundium)");
+      else if (/preterite|simple past|past tense|imperfect/.test(t)) teile.push("Vergangenheitsform");
+      else if (/indicative|subjunctive|imperative|person/.test(t)) teile.push("gebeugte Verbform");
+      if (/comparative/.test(t)) teile.push("Steigerungsform");
+      return teile.length ? teile.join(", ") : "gebeugte Form";
+    }
+
     async function nachschlagen(eingabe, sprache) {
       const hinweise = [];
       const gesucht = artikelEntfernen(eingabe, sprache);
@@ -389,7 +408,7 @@
     }
 
     // ---------------------------------------------------------------
-    // Schritt 5: Ergebnis auf der Seite anzeigen
+    // Schritt 5: Ergebnis anzeigen – alles auf Deutsch
     // Wir benutzen textContent (nicht innerHTML) – so kann kein
     // fremder Code in die Seite gelangen.
     // ---------------------------------------------------------------
@@ -400,60 +419,35 @@
       return e;
     }
 
-    function ergebnisZeigen(gefunden, sprache, eintraege, hinweise) {
-      ergebnis.innerHTML = "";   // altes Ergebnis löschen
-      ergebnis.appendChild(neuesElement("h2", "", gefunden + " (" + SPRACHEN[sprache] + ")"));
-      // Hinweise, z. B. "Eingegeben: „la maison“ – gesucht: „maison“"
-      for (const text of hinweise) ergebnis.appendChild(neuesElement("div", "hinweis", text));
+    // Englische Wortarten (aus en.wiktionary) auf Deutsch
+    const WORTARTEN = {
+      "Noun": "Substantiv", "Proper noun": "Eigenname", "Verb": "Verb", "Adjective": "Adjektiv",
+      "Adverb": "Adverb", "Pronoun": "Pronomen", "Preposition": "Präposition",
+      "Conjunction": "Konjunktion", "Interjection": "Interjektion", "Article": "Artikel",
+      "Determiner": "Begleiter", "Numeral": "Zahlwort", "Participle": "Partizip",
+      "Particle": "Partikel", "Phrase": "Redewendung", "Prepositional phrase": "Wortgruppe",
+      "Proverb": "Sprichwort", "Contraction": "Zusammenziehung", "Prefix": "Vorsilbe",
+      "Suffix": "Nachsilbe", "Abbreviation": "Abkürzung", "Symbol": "Symbol",
+    };
+    function wortartDeutsch(englisch) { return WORTARTEN[englisch] || englisch || ""; }
 
-      let nummer = 0;
-      let beispiel = null;
+    // Kürzel der Sprachen bei Tatoeba (Beispielsätze)
+    const TATOEBA_SPRACHE = { de: "deu", en: "eng", es: "spa", fr: "fra" };
+    const TATOEBA_ADRESSE = "https://api.tatoeba.org/unstable/sentences?sort=relevance&limit=10";
 
-      // Jeder Eintrag ist eine Wortart (Noun = Substantiv, Verb, ...)
-      for (const eintrag of eintraege) {
-        // "Symbol" sind z. B. Sprachcodes ("cat" = Katalanisch) – für Lernende unnütz
-        if (eintrag.partOfSpeech === "Symbol") continue;
-        for (const definition of (eintrag.definitions || [])) {
-          const bedeutung = htmlEntfernen(definition.definition);
-          if (!bedeutung) continue;            // leere überspringen
-          nummer++;
-          if (nummer <= MAX_BEDEUTUNGEN) {
-            const zeile = neuesElement("div", "bedeutung", nummer + ". " + bedeutung + " ");
-            zeile.appendChild(neuesElement("span", "wortart", "[" + (eintrag.partOfSpeech || "?") + "]"));
-            ergebnis.appendChild(zeile);
-          }
-          // Ersten echten Beispielsatz merken
-          if (!beispiel) {
-            for (const b of (definition.parsedExamples || [])) {
-              const satz = htmlEntfernen(b.example);
-              if (satz) {
-                beispiel = { satz, uebersetzung: htmlEntfernen(b.translation), zu: nummer };
-                break;
-              }
-            }
-          }
-        }
+    // Hilfsfunktion: Adresse holen und JSON zurückgeben (oder null bei Problemen)
+    async function jsonHolen(adresse, mitAgent = true) {
+      try {
+        const antwort = await fetch(adresse,
+          mitAgent ? { headers: { "Api-User-Agent": API_USER_AGENT } } : {});
+        return antwort.ok ? await antwort.json() : null;
+      } catch (e) {
+        return null;
       }
-
-      if (nummer === 0) ergebnis.appendChild(neuesElement("p", "", "Keine Bedeutung gefunden."));
-      else if (nummer > MAX_BEDEUTUNGEN)
-        ergebnis.appendChild(neuesElement("div", "wortart", "… und " + (nummer - MAX_BEDEUTUNGEN) + " weitere Bedeutungen"));
-
-      const kasten = neuesElement("div", "beispiel");
-      if (beispiel) {
-        kasten.appendChild(neuesElement("div", "", "Beispiel (zu Bedeutung " + beispiel.zu + "): " + beispiel.satz));
-        if (beispiel.uebersetzung)
-          kasten.appendChild(neuesElement("div", "uebersetzung", "Übersetzung: " + beispiel.uebersetzung));
-      } else {
-        // Wichtig: nichts erfinden!
-        kasten.textContent = "Für dieses Wort gibt es im Wörterbuch keinen Beispielsatz.";
-      }
-      ergebnis.appendChild(kasten);
-      ergebnis.appendChild(neuesElement("div", "hinweis", "Quelle: en.wiktionary.org – Bedeutungen auf Englisch"));
     }
 
     // ---------------------------------------------------------------
-    // Abschnitt "Auf Deutsch"
+    // Wiki-Text (Quelltext von Wiktionary) lesen
     // ---------------------------------------------------------------
 
     // Wiki-Schreibweise in normalen Text umwandeln, z. B.
@@ -465,99 +459,126 @@
       // {{K|ugs.|scherzhaft}} -> "ugs., scherzhaft:"  (K = Kennzeichnung)
       z = z.replace(/\{\{K\|([^{}]*)\}\}/g, (_, inhalt) =>
         inhalt.split("|").filter(teil => !teil.includes("=")).join(", ") + ":");
+      // {{Ü|es|conquistador}} -> "conquistador"  (Ü = Übersetzung)
+      z = z.replace(/\{\{Ü\|[^|{}]*\|([^|{}]*)[^{}]*\}\}/g, "$1");
       // alle anderen {{Vorlagen}} entfernen (von innen nach außen)
       while (/\{\{[^{}]*\}\}/.test(z)) z = z.replace(/\{\{[^{}]*\}\}/g, "");
       // [[Ziel|Text]] -> Text   und   [[Wort]] -> Wort
       z = z.replace(/\[\[(?:[^\]|]*\|)?([^\]]*)\]\]/g, "$1");
+      // "l'''eau''" = Apostroph + kursiv -> "l'eau" (sonst verschwindet der Apostroph)
+      z = z.replace(/'''([^']+?)''(?!')/g, "'$1");
       z = z.replace(/'{2,}/g, "");                        // Kursiv- und Fett-Zeichen ('' und ''')
-      z = z.replace(/<[^>]+>/g, "");                      // restliches HTML
-      return z.replace(/\s+/g, " ").trim();
+      return htmlEntfernen(z);                            // restliches HTML und &nbsp; usw.
     }
 
-    // Sucht im Wiki-Text den Abschnitt der richtigen Sprache,
-    // z. B. "== casa ({{Sprache|Spanisch}}) ==", und darin die Zeilen
-    // unter {{Bedeutungen}} (":[1] das Haus").
-    function bedeutungenAusWikitext(wikitext, sprachName) {
-      const zeilen = [];
-      let richtigeSprache = false;
-      let inBedeutungen = false;
-      for (const zeile of wikitext.split("\n")) {
-        const ueberschrift = zeile.match(/^==[^=].*\{\{Sprache\|([^}|]+)/);
-        if (ueberschrift) {                  // neue Sprache beginnt
-          richtigeSprache = (ueberschrift[1].trim() === sprachName);
-          inBedeutungen = false;
-          continue;
-        }
-        if (!richtigeSprache) continue;
-        if (zeile.startsWith("{{Bedeutungen}}")) { inBedeutungen = true; continue; }
-        if (inBedeutungen) {
-          if (zeile.startsWith("::")) continue;          // Unterpunkte überspringen
-          if (zeile.startsWith("*")) continue;           // Gruppen wie "*{{K|intrans.}}" überspringen
-          if (zeile.startsWith(":")) {
-            // ":[1] das Haus" -> "das Haus"
-            const text = wikiTextSaeubern(zeile.replace(/^:\s*(\[[^\]]*\])?/, ""));
-            if (text) zeilen.push(text);
-          } else {
-            inBedeutungen = false;           // Block ist zu Ende
-          }
+    // Schneidet aus einer Seite den Teil der richtigen Sprache heraus,
+    // z. B. alles unter "== casa ({{Sprache|Spanisch}}) ==" bis zur nächsten Sprache.
+    function sprachAbschnitt(wikitext, sprachName) {
+      const teile = wikitext.split(/^(?===[^=])/m);   // bei jeder Sprach-Überschrift teilen
+      for (const teil of teile) {
+        const kopf = teil.split("\n")[0];
+        const m = kopf.match(/\{\{Sprache\|([^}|]+)/);
+        if (m && m[1].trim() === sprachName) return teil;
+      }
+      return "";
+    }
+
+    // Holt die Zeilen eines Blocks, z. B. unter {{Bedeutungen}} oder {{Beispiele}}.
+    // Gibt Paare zurück: { text, unterzeilen: [...] }  (Unterzeilen beginnen mit "::")
+    // Die Wortart merken wir uns aus Überschriften wie "=== {{Wortart|Substantiv|Spanisch}} ===".
+    function blockLesen(abschnitt, blockName) {
+      const ergebnis = [];
+      let wortart = "";
+      let imBlock = false;
+      for (const zeile of abschnitt.split("\n")) {
+        const art = zeile.match(/^===.*?\{\{Wortart\|([^|}]+)/);
+        if (art) { wortart = art[1]; imBlock = false; continue; }
+        if (zeile.startsWith("{{" + blockName + "}}")) { imBlock = true; continue; }
+        if (!imBlock) continue;
+        if (zeile.startsWith("::")) {                // Unterzeile (z. B. Übersetzung)
+          if (ergebnis.length) ergebnis[ergebnis.length - 1].unterzeilen.push(wikiTextSaeubern(zeile.slice(2)));
+        } else if (zeile.startsWith(":")) {
+          // ":[1] das Haus" -> "das Haus"
+          const roh = zeile.replace(/^:\s*(\[[^\]]*\])?/, "");
+          if (/Beispiele fehlen/.test(roh)) continue;  // Platzhalter "Beispiel fehlt"
+          const text = wikiTextSaeubern(roh);
+          if (text) ergebnis.push({ text, wortart, unterzeilen: [] });
+        } else if (!zeile.startsWith("*")) {
+          imBlock = false;                           // Block ist zu Ende
         }
       }
-      return zeilen;
+      return ergebnis;
     }
 
-    // Holt aus dem deutschen Wiktionary die deutschen Bedeutungen.
-    // Wir fragen mehrere Schreibweisen auf einmal an (mit | getrennt).
-    async function deutschAusWiktionary(varianten, sprache) {
-      const adresse = DE_ADRESSE + encodeURIComponent(varianten.join("|"));
-      const antwort = await fetch(adresse, { headers: { "Api-User-Agent": API_USER_AGENT } });
-      if (!antwort.ok) return null;
-      const daten = await antwort.json();
-      const abfrage = daten.query || {};
-      // Seiten nach Titel ablegen, damit wir die Reihenfolge der Varianten einhalten
+    // Mehrere Seiten auf einmal holen (Titel mit | getrennt). Gibt { titel: wikitext } zurück.
+    async function seitenHolen(basisAdresse, titelListe) {
+      const daten = await jsonHolen(basisAdresse + encodeURIComponent(titelListe.join("|")));
+      const abfrage = (daten && daten.query) || {};
       const seiten = {};
       for (const seite of abfrage.pages || []) {
         if (!seite.missing && seite.revisions) seiten[seite.title] = seite.revisions[0].slots.main.content;
       }
-      // Umbenennungen berücksichtigen (Weiterleitung oder Unicode-Normalisierung)
+      // Umbenennungen berücksichtigen (Weiterleitung oder Normalisierung)
       for (const w of [...(abfrage.normalized || []), ...(abfrage.redirects || [])]) {
         if (seiten[w.to]) seiten[w.from] = seiten[w.to];
       }
+      return seiten;
+    }
+
+    // ---------------------------------------------------------------
+    // Quellen für die deutsche Bedeutung
+    // ---------------------------------------------------------------
+
+    // Quelle 1: der passende Eintrag im deutschen Wiktionary
+    // Gibt { titel, bedeutungen, beispiele } zurück (oder null)
+    async function deutschenEintragHolen(varianten, sprache) {
+      const seiten = await seitenHolen(DE_ADRESSE, varianten);
       for (const titel of varianten) {
         if (!seiten[titel]) continue;
-        const zeilen = bedeutungenAusWikitext(seiten[titel], SPRACHEN[sprache]);
-        if (zeilen.length) return { titel, zeilen };
+        const abschnitt = sprachAbschnitt(seiten[titel], SPRACHEN[sprache]);
+        if (!abschnitt) continue;
+        const bedeutungen = blockLesen(abschnitt, "Bedeutungen");
+        if (bedeutungen.length) return { titel, bedeutungen, beispiele: blockLesen(abschnitt, "Beispiele") };
       }
       return null;
     }
 
-    // ---------------------------------------------------------------
-    // Zweite Quelle für Deutsch: die Übersetzungstabellen im englischen
-    // Wiktionary. Dort steht z. B. bei "possibility":
-    //   * German: {{t+|de|Möglichkeit|f}}
-    // Für ein französisches Wort nehmen wir seine englische Bedeutung
-    // ("possibilité" -> "possibility") und schauen dort nach.
-    // ---------------------------------------------------------------
+    // Quelle 2: deutsche Einträge, deren Übersetzungstabelle das Wort nennt.
+    // Beispiel: Die Seite "Eroberer" enthält {{Ü|es|conquistador}}.
+    async function rueckwaertsSuchen(wort, sprache) {
+      const adresse = "https://de.wiktionary.org/w/api.php?action=query&list=search&srprop=" +
+                      "&srlimit=4&format=json&formatversion=2&origin=*&srsearch=" +
+                      encodeURIComponent('insource:"Ü|' + sprache + "|" + wort + '"');
+      const daten = await jsonHolen(adresse);
+      const titel = ((daten && daten.query && daten.query.search) || []).map(e => e.title);
+      return titel.length ? titel : null;
+    }
 
-    // Aus den englischen Bedeutungen ein kurzes Stichwort machen:
-    // "(transitive) to eat, to dine" -> "eat"
-    function englischesStichwort(eintraege) {
+    // Englische Stichwörter aus den Bedeutungen sammeln:
+    // "conquering; winning" / "conqueror, conquistador" -> conquering, winning, conqueror, ...
+    function englischeStichwoerter(eintraege) {
+      const liste = [];
+      let gezaehlt = 0;
       for (const eintrag of eintraege) {
         for (const definition of (eintrag.definitions || [])) {
           const html = definition.definition || "";
-          if (html.includes("form-of-definition")) continue;   // "plural of ..." überspringen
-          let text = htmlEntfernen(html).replace(/\([^)]*\)/g, " ");  // Klammern weg
-          text = text.split(/[,;:.]/)[0].trim();
-          text = text.replace(/^(to|a|an|the)\s+/i, "").trim();
-          if (text && text.split(" ").length <= 3) return text;
-          if (text) return null;   // erste Bedeutung ist ein langer Satz -> kein Stichwort
+          if (html.includes("form-of-definition") || !htmlEntfernen(html)) continue;
+          if (++gezaehlt > 4) break;                 // nur die ersten 4 Bedeutungen
+          const text = htmlEntfernen(html).replace(/\([^)]*\)/g, " ");   // Klammern weg
+          for (let teil of text.split(/[,;:.]/)) {
+            teil = teil.trim().replace(/^(to|a|an|the)\s+/i, "").trim();
+            // Wortart merken, damit wir sie später (auf Deutsch) anzeigen können
+            if (teil && teil.split(" ").length <= 3 && !liste.some(x => x.wort === teil))
+              liste.push({ wort: teil, art: eintrag.partOfSpeech });
+          }
         }
       }
-      return null;
+      return liste.slice(0, 8);
     }
 
     const ARTIKEL_DE = { m: "der", f: "die", n: "das", p: "die" };
 
-    // Liest aus dem Wiki-Text die deutschen Wörter der ersten passenden Tabelle
+    // Liest aus dem Wiki-Text die deutschen Wörter der ersten geprüften Tabelle
     function deutscheUebersetzungen(wikitext) {
       let sinn = "";
       let ungeprueft = false;
@@ -572,108 +593,238 @@
         if (ungeprueft || !/^\*\s*German\s*:/.test(zeile)) continue;
         // {{t+|de|Möglichkeit|f}}  (auch t, tt, tt+)
         const woerter = [];
-        for (const m of zeile.matchAll(/\{\{tt?\+?\|de\|([^|}]+)(?:\|([mfnp]))?/g)) {
-          const wort = m[1].trim();
-          woerter.push(m[2] ? ARTIKEL_DE[m[2]] + " " + wort : wort);
+        // Das Wort darf selbst Links enthalten: {{t|de|[[glücklich]]er [[Zufall]]}}
+        for (const m of zeile.matchAll(/\{\{tt?\+?\|de\|((?:\[\[[^\]]*\]\]|[^|}\[])+)(?:\|([mfnp]))?/g)) {
+          const wort = wikiTextSaeubern(m[1]);
+          // Artikel nur bei einzelnen Wörtern ("die Katze", aber "glücklicher Zufall")
+          woerter.push(m[2] && !wort.includes(" ") ? ARTIKEL_DE[m[2]] + " " + wort : wort);
         }
         if (woerter.length) return { woerter: [...new Set(woerter)].slice(0, 4), sinn };
       }
       return null;
     }
 
-    async function deutschUeberEnglisch(stichwort) {
-      // Manche Seiten haben die Tabelle auf einer Unterseite ("water/translations").
-      // Wir fragen beide Seiten auf einmal ab.
-      const titel = [stichwort + "/translations", stichwort];
-      const adresse = EN_SEITEN_ADRESSE + encodeURIComponent(titel.join("|"));
-      const antwort = await fetch(adresse, { headers: { "Api-User-Agent": API_USER_AGENT } });
-      if (!antwort.ok) return null;
-      const daten = await antwort.json();
-      const seiten = {};
-      for (const seite of (daten.query && daten.query.pages) || []) {
-        if (!seite.missing && seite.revisions) seiten[seite.title] = seite.revisions[0].slots.main.content;
-      }
-      for (const t of titel) {
-        if (!seiten[t]) continue;
-        // Nur den englischen Teil der Seite nehmen (bis zur nächsten Sprache)
-        const englisch = (seiten[t].split(/^==English==\s*$/m)[1] || seiten[t]).split(/^==[^=]/m)[0];
-        const ergebnis = deutscheUebersetzungen(englisch);
-        if (ergebnis) return { ...ergebnis, seite: stichwort };
+    // Quelle 3: Übersetzungstabellen im englischen Wiktionary.
+    // Wir fragen alle Stichwörter (und ihre "/translations"-Unterseiten) auf einmal ab.
+    async function deutschUeberEnglisch(stichwoerter) {
+      const titel = [];
+      for (const s of stichwoerter) titel.push(s + "/translations", s);
+      const seiten = await seitenHolen(EN_SEITEN_ADRESSE, titel);
+      for (const s of stichwoerter) {
+        for (const t of [s + "/translations", s]) {
+          if (!seiten[t]) continue;
+          // Nur den englischen Teil der Seite nehmen (bis zur nächsten Sprache)
+          const englisch = (seiten[t].split(/^==English==\s*$/m)[1] || seiten[t]).split(/^==[^=]/m)[0];
+          const gefunden = deutscheUebersetzungen(englisch);
+          if (gefunden) return { ...gefunden, seite: s };
+        }
       }
       return null;
     }
 
-    // Notlösung: maschinelle Übersetzung (MyMemory, kostenlos, ohne Schlüssel)
-    async function maschinellUebersetzen(wort, sprache) {
-      const adresse = MT_ADRESSE + sprache + "|de&q=" + encodeURIComponent(wort);
-      const antwort = await fetch(adresse);
-      if (!antwort.ok) return null;
-      const daten = await antwort.json();
-      if (daten.responseStatus !== 200 || daten.quotaFinished) return null;
-      const text = htmlEntfernen(daten.responseData && daten.responseData.translatedText);
-      // Kam das Wort unverändert zurück? Dann ist es keine echte Übersetzung.
-      if (!text || text.toLowerCase() === wort.toLowerCase()) return null;
-      return text;
+    // Quelle 4 (Notlösung): maschinelle Übersetzung (MyMemory, kostenlos, ohne Schlüssel)
+    async function maschinellUebersetzen(text, sprache) {
+      const daten = await jsonHolen(MT_ADRESSE + sprache + "|de&q=" + encodeURIComponent(text), false);
+      if (!daten || daten.responseStatus !== 200 || daten.quotaFinished) return null;
+      const ergebnis = htmlEntfernen(daten.responseData && daten.responseData.translatedText);
+      // Kam der Text unverändert zurück? Dann ist es keine echte Übersetzung.
+      if (!ergebnis || ergebnis.toLowerCase() === text.toLowerCase()) return null;
+      return ergebnis;
     }
 
-    // Baut den Abschnitt "Auf Deutsch" unter das Ergebnis
-    async function deutschZeigen(gefunden, eingabe, sprache, eintraege) {
-      const kasten = neuesElement("div", "deutsch");
-      // Bei deutschen Wörtern gibt es keine Übersetzung, sondern die Bedeutung
-      kasten.appendChild(neuesElement("h3", "", sprache === "de" ? "Bedeutung auf Deutsch" : "Auf Deutsch"));
-      const inhalt = neuesElement("div", "", "Lädt …");
-      kasten.appendChild(inhalt);
-      const quelle = neuesElement("div", "hinweis", "");
-      kasten.appendChild(quelle);
-      // Vor den Quellen-Hinweis des Hauptergebnisses (letzte Zeile) einfügen
-      ergebnis.insertBefore(kasten, ergebnis.lastChild);
-
-      // Schreibweisen: gefundenes Wort, Eingabe, groß, klein (ohne doppelte)
+    // Sucht die deutsche Bedeutung in der Reihenfolge 1 -> 4.
+    // Gibt { zeilen: [{text, wortart}], quelle, eintrag } zurück.
+    async function deutscheBedeutungFinden(gefunden, eingabe, sprache, eintraege) {
       const gross = gefunden.charAt(0).toUpperCase() + gefunden.slice(1);
-      const varianten = [...new Set([gefunden, eingabe, gross, gefunden.toLowerCase()])];
+      const varianten = [...new Set([gefunden, gross, gefunden.toLowerCase(), eingabe])];
 
-      try {
-        const treffer = await deutschAusWiktionary(varianten, sprache);
-        if (treffer) {
-          inhalt.textContent = "";
-          treffer.zeilen.slice(0, MAX_BEDEUTUNGEN).forEach((text, i) =>
-            inhalt.appendChild(neuesElement("div", "bedeutung", (i + 1) + ". " + text)));
-          if (treffer.zeilen.length > MAX_BEDEUTUNGEN)
-            inhalt.appendChild(neuesElement("div", "wortart",
-              "… und " + (treffer.zeilen.length - MAX_BEDEUTUNGEN) + " weitere"));
-          quelle.textContent = "Quelle: de.wiktionary.org (Eintrag „" + treffer.titel + "“)";
-          return;
+      const eintrag = await deutschenEintragHolen(varianten, sprache);
+      if (eintrag) return { zeilen: eintrag.bedeutungen, eintrag,
+        quelle: "Quelle: de.wiktionary.org (Eintrag „" + eintrag.titel + "“)" };
+      if (sprache === "de") return { zeilen: [], quelle: "" };   // Deutsch: nichts übersetzen
+
+      // Quelle 2 und 3 gleichzeitig fragen (spart Zeit):
+      // 2 = Übersetzungstabellen im englischen Wiktionary (über die englische Bedeutung)
+      // 3 = deutsche Einträge, die das Wort als Übersetzung nennen (Rückwärtssuche)
+      const liste = sprache === "en" ? [{ wort: gefunden, art: "" }] : englischeStichwoerter(eintraege);
+      const stichwoerter = liste.map(x => x.wort);
+      const [tabelle, rueck] = await Promise.all([
+        stichwoerter.length ? deutschUeberEnglisch(stichwoerter) : null,
+        rueckwaertsSuchen(gefunden, sprache),
+      ]);
+      if (tabelle) {
+        // Die Rückwärtssuche liefert oft auch verwandte Wörter ("Sitzgelegenheit").
+        // Darum nur als Bestätigung: Wörter, die in beiden Quellen stehen.
+        const ohneArtikel = w => w.replace(/^(der|die|das) /, "");
+        const bestaetigt = (rueck || []).filter(t => tabelle.woerter.some(w => ohneArtikel(w) === t));
+        // (Die englische Erklärung der Tabelle zeigen wir nicht – alles soll Deutsch sein.)
+        const art = (liste.find(x => x.wort === tabelle.seite) || {}).art;
+        return { zeilen: [{ text: tabelle.woerter.join(", "), wortart: art ? wortartDeutsch(art) : "" }],
+          quelle: "Quelle: en.wiktionary.org – Übersetzungstabelle von „" + tabelle.seite + "“" +
+                  (sprache === "en" ? "" : " (über die englische Bedeutung)") +
+                  (bestaetigt.length ? "; bestätigt durch de.wiktionary („" + bestaetigt.join("“, „") + "“)" : "") };
+      }
+      if (rueck) return { zeilen: [{ text: rueck.join(", ") }],
+        quelle: "Quelle: de.wiktionary.org – deutsche Einträge, die „" + gefunden +
+                "“ als " + SPRACHEN[sprache] + "-Übersetzung nennen" };
+
+      const mt = await maschinellUebersetzen(gefunden, sprache);
+      if (mt) return { zeilen: [{ text: mt }], quelle: "Maschinelle Übersetzung (MyMemory) – kann ungenau sein" };
+      return { zeilen: [], quelle: "" };
+    }
+
+    // ---------------------------------------------------------------
+    // Quellen für den Beispielsatz (immer mit deutscher Übersetzung)
+    // ---------------------------------------------------------------
+
+    // Tatoeba: echte Sätze von Freiwilligen, mit deutscher Übersetzung.
+    // "=wort" sucht genau diese Wortform.
+    async function tatoebaBeispiel(woerter, sprache) {
+      // Durchgang 1: genau diese Wortform ("=wort").
+      // Durchgang 2: auch andere Formen ("bouquiner" -> "bouquine"), aber nur Sätze,
+      // in denen ein Wort mit demselben Anfang vorkommt (Wort ohne den letzten Buchstaben).
+      const versuche = woerter.map(w => ({ wort: w, genau: true }));
+      if (!woerter[0].includes(" ") && woerter[0].length >= 5) versuche.push({ wort: woerter[0], genau: false });
+      for (const { wort, genau } of versuche) {
+        const suche = wort.includes(" ") ? '"' + wort + '"' : (genau ? "=" : "") + wort;
+        let adresse = TATOEBA_ADRESSE + "&lang=" + TATOEBA_SPRACHE[sprache] + "&q=" + encodeURIComponent(suche);
+        if (sprache !== "de") adresse += "&" + encodeURIComponent("trans:lang") + "=deu";
+        const daten = await jsonHolen(adresse, false);
+        let saetze = (daten && daten.data) || [];
+        if (!genau) {
+          const anfang = wort.slice(0, -1).toLowerCase();
+          saetze = saetze.filter(s => s.text.toLowerCase().split(/[^\p{L}]+/u).some(t => t.startsWith(anfang)));
         }
-        // Zweite Quelle: Übersetzungstabelle im englischen Wiktionary.
-        // Englische Wörter direkt, andere über ihre englische Bedeutung.
-        if (sprache !== "de") {
-          const stichwort = sprache === "en" ? gefunden : englischesStichwort(eintraege);
-          const tabelle = stichwort ? await deutschUeberEnglisch(stichwort) : null;
-          if (tabelle) {
-            inhalt.textContent = tabelle.woerter.join(", ");
-            if (tabelle.sinn) inhalt.appendChild(neuesElement("div", "wortart", "im Sinne von: " + tabelle.sinn));
-            quelle.textContent = sprache === "en"
-              ? "Quelle: en.wiktionary.org – Übersetzungstabelle von „" + tabelle.seite + "“"
-              : "Quelle: en.wiktionary.org – Übersetzungstabelle von „" + tabelle.seite +
-                "“ (indirekt über die englische Bedeutung)";
-            return;
+        // Lieber einen richtigen Satz (mind. 3 Wörter, nicht zu lang) als "Maison !"
+        const passend = saetze.find(s => s.text.split(" ").length >= 3 && s.text.length <= 120) || saetze[0];
+        if (!passend) continue;
+        if (sprache === "de") return { satz: passend.text, deutsch: "",
+                                       quelle: "Quelle: tatoeba.org" + (genau ? "" : " (Satz mit einer anderen Form des Wortes)") };
+        const uebers = (passend.translations || []).filter(t => t.lang === "deu");
+        const beste = uebers.find(t => t.is_direct) || uebers[0];
+        if (beste) return { satz: passend.text, deutsch: beste.text,
+                            quelle: "Quelle: tatoeba.org" + (genau ? "" : " (Satz mit einer anderen Form des Wortes)") };
+      }
+      return null;
+    }
+
+    // Sucht einen Beispielsatz in der Reihenfolge:
+    // 1. de.wiktionary (mit deutscher Übersetzung), 2. Tatoeba,
+    // 3. en.wiktionary-Satz + maschinelle deutsche Übersetzung (gekennzeichnet)
+    async function beispielFinden(gefunden, eingabe, sprache, eintraege, deEintrag) {
+      const kurz = b => b.text.length <= 160;
+      const deBeispiele = (deEintrag && deEintrag.beispiele) || [];
+      if (sprache === "de") {
+        // Zitate aus Zeitungen/Büchern stehen in „…“ und sind oft lang -> lieber einfache Sätze
+        const b = deBeispiele.find(x => kurz(x) && !x.text.startsWith("„"));
+        if (b) return { satz: b.text, deutsch: "", quelle: "Quelle: de.wiktionary.org" };
+      } else {
+        const b = deBeispiele.find(x => x.unterzeilen.length && kurz(x));
+        if (b) return { satz: b.text, deutsch: b.unterzeilen[0], quelle: "Quelle: de.wiktionary.org" };
+      }
+
+      const formen = [...new Set([gefunden, eingabe.toLowerCase() === gefunden.toLowerCase() ? gefunden : eingabe])];
+      const tatoeba = await tatoebaBeispiel(formen, sprache);
+      if (tatoeba) return tatoeba;
+
+      if (sprache === "de" && deBeispiele.length) {      // Zitate nur als Notlösung (das kürzeste)
+        const b = [...deBeispiele].sort((x, y) => x.text.length - y.text.length)[0];
+        return { satz: b.text, deutsch: "", quelle: "Quelle: de.wiktionary.org" };
+      }
+
+      // en.wiktionary-Beispiel (Originalsprache); die englische Übersetzung zeigen wir nicht
+      for (const eintrag of eintraege) {
+        for (const definition of (eintrag.definitions || [])) {
+          for (const b of (definition.parsedExamples || [])) {
+            const satz = htmlEntfernen(b.example);
+            if (!satz) continue;
+            if (sprache === "de") return { satz, deutsch: "", quelle: "Quelle: en.wiktionary.org" };
+            const deutsch = await maschinellUebersetzen(satz, sprache);
+            if (deutsch) return { satz, deutsch, quelle: "Satz: en.wiktionary.org – " +
+                                  "deutsche Übersetzung maschinell (MyMemory), kann ungenau sein" };
           }
         }
-        // Nichts gefunden: bei Fremdsprachen maschinell übersetzen
-        if (sprache !== "de") {
-          const mt = await maschinellUebersetzen(gefunden, sprache);
-          if (mt) {
-            inhalt.textContent = mt;
-            quelle.textContent = "Maschinelle Übersetzung (MyMemory) – kann ungenau sein";
-            return;
-          }
+      }
+      return null;
+    }
+
+    // ---------------------------------------------------------------
+    // Alles zusammen anzeigen
+    // ---------------------------------------------------------------
+    async function ergebnisZeigen(gefunden, eingabe, sprache, eintraege, hinweise) {
+      ergebnis.innerHTML = "";   // altes Ergebnis löschen
+      ergebnis.appendChild(neuesElement("h2", "", gefunden + " (" + SPRACHEN[sprache] + ")"));
+      const wortartZeile = neuesElement("div", "wortart", "");
+      ergebnis.appendChild(wortartZeile);
+      // Hinweise, z. B. "Eingegeben: „la maison“ – gesucht: „maison“"
+      for (const text of hinweise) ergebnis.appendChild(neuesElement("div", "hinweis", text));
+
+      // Kasten 1: deutsche Bedeutung (Hauptteil)
+      const deKasten = neuesElement("div", "deutsch");
+      deKasten.appendChild(neuesElement("h3", "", sprache === "de" ? "Bedeutung auf Deutsch" : "Auf Deutsch"));
+      const deInhalt = neuesElement("div", "", "Lädt …");
+      const deQuelle = neuesElement("div", "hinweis", "");
+      deKasten.append(deInhalt, deQuelle);
+
+      // Kasten 2: Beispielsatz
+      const bspKasten = neuesElement("div", "beispiel");
+      bspKasten.appendChild(neuesElement("h3", "", "Beispiel"));
+      const bspInhalt = neuesElement("div", "", "Lädt …");
+      const bspQuelle = neuesElement("div", "hinweis", "");
+      bspKasten.append(bspInhalt, bspQuelle);
+      ergebnis.append(deKasten, bspKasten);
+
+      // Klappbereich: englische Erklärung (nur bei Bedarf aufklappen)
+      const klapp = document.createElement("details");
+      klapp.appendChild(neuesElement("summary", "", "Englische Erklärung anzeigen"));
+      let nummer = 0;
+      for (const eintrag of eintraege) {
+        if (eintrag.partOfSpeech === "Symbol") continue;   // Sprachcodes weglassen
+        for (const definition of (eintrag.definitions || [])) {
+          const text = htmlEntfernen(definition.definition);
+          if (!text || ++nummer > 5) continue;
+          const zeile = neuesElement("div", "bedeutung", nummer + ". " + text + " ");
+          zeile.appendChild(neuesElement("span", "wortart", "[" + wortartDeutsch(eintrag.partOfSpeech) + "]"));
+          klapp.appendChild(zeile);
         }
+      }
+      klapp.appendChild(neuesElement("div", "hinweis", "Quelle: en.wiktionary.org"));
+      ergebnis.appendChild(klapp);
+
+      // Deutsche Bedeutung zuerst (das Beispiel kann den de.wiktionary-Eintrag mitbenutzen)
+      const bedeutung = await deutscheBedeutungFinden(gefunden, eingabe, sprache, eintraege);
+      deInhalt.textContent = "";
+      if (bedeutung.zeilen.length) {
+        let letzteArt = null;
+        bedeutung.zeilen.slice(0, 4).forEach((z, i) => {
+          if (z.wortart && z.wortart !== letzteArt && bedeutung.zeilen.length > 1)
+            deInhalt.appendChild(neuesElement("div", "wortart", z.wortart));
+          letzteArt = z.wortart;
+          const nr = bedeutung.zeilen.length > 1 ? (i + 1) + ". " : "";
+          deInhalt.appendChild(neuesElement("div", "bedeutung", nr + z.text));
+          if (z.zusatz) deInhalt.appendChild(neuesElement("div", "wortart", z.zusatz));
+        });
+        if (bedeutung.zeilen.length > 4)
+          deInhalt.appendChild(neuesElement("div", "wortart", "… und " + (bedeutung.zeilen.length - 4) + " weitere"));
+        deQuelle.textContent = bedeutung.quelle;
+      } else {
         // Wichtig: nichts erfinden!
-        inhalt.textContent = sprache === "de"
-          ? "Keine deutsche Bedeutung gefunden."
-          : "Keine deutsche Übersetzung gefunden.";
-      } catch (e) {
-        inhalt.textContent = "Der deutsche Teil konnte nicht geladen werden (Internet?).";
+        deInhalt.textContent = sprache === "de" ? "Keine deutsche Bedeutung gefunden." : "Keine deutsche Übersetzung gefunden.";
+      }
+
+      // Wortart auf Deutsch (aus de.wiktionary, sonst aus en.wiktionary übersetzt)
+      const deArt = bedeutung.zeilen.find(z => z.wortart);
+      const enArt = eintraege.find(e => e.partOfSpeech !== "Symbol");
+      wortartZeile.textContent = deArt ? deArt.wortart : (enArt ? wortartDeutsch(enArt.partOfSpeech) : "");
+
+      const beispiel = await beispielFinden(gefunden, eingabe, sprache, eintraege, bedeutung.eintrag);
+      bspInhalt.textContent = "";
+      if (beispiel) {
+        bspInhalt.appendChild(neuesElement("div", "", beispiel.satz));
+        if (beispiel.deutsch) bspInhalt.appendChild(neuesElement("div", "uebersetzung", "Deutsch: " + beispiel.deutsch));
+        bspQuelle.textContent = beispiel.quelle;
+      } else {
+        bspInhalt.textContent = "Für dieses Wort habe ich keinen Beispielsatz gefunden.";
       }
     }
 
@@ -703,8 +854,7 @@
 
       try {
         const { gefunden, eintraege, hinweise } = await nachschlagen(wort, sprache);
-        ergebnisZeigen(gefunden, sprache, eintraege, hinweise);
-        await deutschZeigen(gefunden, wort, sprache, eintraege);   // Abschnitt "Auf Deutsch"
+        await ergebnisZeigen(gefunden, wort, sprache, eintraege, hinweise);
       } catch (e) {
         if (e instanceof WortNichtGefunden)
           meldungZeigen("Das Wort „" + wort + "“ wurde auf " + SPRACHEN[sprache] + " nicht gefunden.", true);
