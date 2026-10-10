@@ -873,9 +873,25 @@
     // ---------------------------------------------------------------
     // Spracheingabe mit dem Mikrofon (Web Speech API)
     // Chrome und Safari kennen sie unter verschiedenen Namen.
+    //
+    // Besonderheiten auf iPhone/iPad (Safari), darum ist der Code etwas länger:
+    // - Die Erkennung muss DIREKT beim Tippen starten (nicht später).
+    // - Oft kommen nur "Zwischenergebnisse" und nie ein Endergebnis.
+    //   Darum merken wir uns immer den letzten erkannten Text und benutzen ihn,
+    //   sobald eine kurze Pause kommt oder die Erkennung endet.
+    // - Manchmal endet die Erkennung nie von selbst -> wir stoppen sie selbst.
+    // - Als App auf dem Home-Bildschirm geht es bei vielen iOS-Versionen gar nicht.
     // ---------------------------------------------------------------
     const Spracherkennung = window.SpeechRecognition || window.webkitSpeechRecognition;
     let erkennung = null;   // die laufende Erkennung (oder null)
+    let letzterText = "";   // zuletzt erkannter Text (auch Zwischenergebnis)
+    let fertig = true;      // wurde die laufende Erkennung schon ausgewertet?
+    let uhren = {};         // Zeitschalter (Pause, Höchstdauer, Startkontrolle)
+
+    // Läuft die Seite als App vom Home-Bildschirm (ohne Safari-Leiste)?
+    const alsApp = window.navigator.standalone === true ||
+                   window.matchMedia("(display-mode: standalone)").matches;
+    const istApple = /iPhone|iPad|iPod|Macintosh/.test(navigator.userAgent) && "ontouchend" in document;
 
     // Aus dem Gesprochenen höchstens 3 Wörter nehmen (z. B. "la maison").
     // Den Artikel entfernt später die Suche.
@@ -886,69 +902,195 @@
       return sprache === "de" ? wort : wort.toLowerCase();
     }
 
+    function mikroHinweisZeigen(text) {
+      mikroHinweis.hidden = !text;
+      mikroHinweis.textContent = text || "";
+    }
+
+    // Notlösung: Wortfeld anwählen, damit die Tastatur mit ihrem Mikrofon erscheint.
+    // (iPhone öffnet die Tastatur nur, wenn das direkt beim Tippen passiert.)
+    const TASTATUR_TIPP = "Tippe ins Wortfeld und dann auf das Mikrofon 🎤 unten auf der Tastatur – " +
+                          "dann wird das Wort automatisch nachgeschlagen.";
+    function tastaturAnbieten(grund) {
+      mikroHinweisZeigen((grund ? grund + " " : "") + TASTATUR_TIPP);
+      wortFeld.focus();
+    }
+
+    function uhrenStoppen() {
+      for (const name in uhren) clearTimeout(uhren[name]);
+      uhren = {};
+    }
+
     function mikroZuruecksetzen() {
+      uhrenStoppen();
       erkennung = null;
       mikroKnopf.classList.remove("hoert");
       mikroKnopf.textContent = "🎤";
     }
 
+    // Die Erkennung beenden und auswerten. Wird nur EINMAL pro Versuch ausgeführt
+    // (egal ob durch Pause, Höchstdauer, Fehler oder Ende).
+    function abschliessen(fehlerText) {
+      if (fertig) return;
+      fertig = true;
+      const alte = erkennung;
+      mikroZuruecksetzen();
+      if (alte) { try { alte.abort(); } catch (e) { /* schon beendet */ } }
+
+      const sprache = spracheFeld.value;
+      const wort = erstesWort(letzterText, sprache);
+      if (wort) {
+        // Etwas verstanden (auch nur als Zwischenergebnis) -> nachschlagen
+        mikroHinweisZeigen("");
+        wortFeld.value = wort;
+        if (formular.requestSubmit) formular.requestSubmit();
+        else formular.dispatchEvent(new Event("submit", { cancelable: true }));
+        return;
+      }
+      meldungZeigen(fehlerText || "Ich habe nichts verstanden. Bitte nochmal tippen und " +
+                    "deutlich ein Wort sagen.", true);
+      // Hat es auf diesem Gerät noch nie geklappt? Dann die Tastatur als Ausweg zeigen.
+      if (!localStorage.getItem("mikroHatGeklappt")) mikroHinweisZeigen(TASTATUR_TIPP);
+    }
+
+    // Nach jedem erkannten Stück: kurze Pause abwarten, dann fertig
+    function pauseAbwarten() {
+      clearTimeout(uhren.pause);
+      uhren.pause = setTimeout(() => abschliessen(), 1500);
+    }
+
+    const FEHLER_MELDUNGEN = {
+      "not-allowed": "Das Mikrofon ist nicht erlaubt. iPhone: Einstellungen › Safari › Mikrofon › " +
+                     "„Erlauben“ – und Einstellungen › Siri bzw. Tastatur › „Diktierfunktion“ einschalten.",
+      "service-not-allowed": "Die Spracherkennung ist hier nicht verfügbar. Bitte „Diktierfunktion“ bzw. Siri " +
+                             "einschalten" + (alsApp ? " oder die Seite in Safari öffnen (nicht als App)." : "."),
+      "no-speech": "Ich habe nichts gehört. Bitte nochmal tippen und gleich danach sprechen.",
+      "audio-capture": "Kein Mikrofon gefunden (oder es wird gerade von einer anderen App benutzt).",
+      "network": "Für die Spracherkennung braucht es Internet.",
+      "language-not-supported": "Diese Sprache kann die Spracherkennung hier nicht.",
+    };
+
     if (!Spracherkennung) {
-      // Browser kann es nicht -> Knopf verstecken und Tipp zeigen
-      mikroKnopf.hidden = true;
-      mikroHinweis.hidden = false;
-      mikroHinweis.textContent = "Tipp: Zum Sprechen das Mikrofon auf der Handy-Tastatur benutzen.";
+      // Browser kann es nicht -> Knopf führt direkt zur Tastatur
+      mikroKnopf.addEventListener("click", () => tastaturAnbieten("Dieser Browser kann keine Spracheingabe."));
     } else {
+      // Als Home-Bildschirm-App ist die Spracheingabe bei vielen iOS-Versionen kaputt
+      // (der Knopf scheint zu gehen, aber es passiert nichts). Gleich einen Hinweis zeigen.
+      if (alsApp && istApple && !localStorage.getItem("mikroHatGeklappt"))
+        mikroHinweisZeigen("Hinweis: Als App vom Home-Bildschirm klappt das 🎤 auf iPhone/iPad oft nicht. " +
+                           "Dann die Seite in Safari öffnen – oder das Mikrofon der Tastatur benutzen.");
+
       mikroKnopf.addEventListener("click", () => {
-        // Hört schon zu? Dann beim zweiten Tippen stoppen.
-        if (erkennung) { erkennung.stop(); return; }
+        // Hört schon zu? Dann beim zweiten Tippen beenden und das Gehörte benutzen.
+        if (erkennung) { abschliessen(); return; }
+
+        // Hat es hier schon einmal gar nicht funktioniert (als App)? Dann gleich die Tastatur.
+        // (Gemerkt wird das nur 7 Tage – vielleicht klappt es nach einem iOS-Update.)
+        if (alsApp && Date.now() - Number(localStorage.getItem("mikroGehtNicht") || 0) < 7 * 24 * 3600 * 1000) {
+          tastaturAnbieten("Die Spracheingabe geht in der Home-Bildschirm-App nicht.");
+          return;
+        }
+        if (!navigator.onLine) { meldungZeigen(FEHLER_MELDUNGEN.network, true); return; }
 
         const sprache = spracheFeld.value;
+        letzterText = "";
+        fertig = false;
+        // Jedes Mal eine NEUE Erkennung (alte können auf iOS "hängen bleiben")
         erkennung = new Spracherkennung();
         erkennung.lang = ERKENNUNGS_SPRACHE[sprache];
-        erkennung.interimResults = false;   // nur das Endergebnis
+        erkennung.continuous = true;       // nicht nach 3 s abbrechen – wir beenden selbst
+        erkennung.interimResults = true;   // auch Zwischenergebnisse (iOS liefert oft nur diese)
         erkennung.maxAlternatives = 1;
+        let gestartet = false;
 
         erkennung.onstart = () => {
+          gestartet = true;
+          clearTimeout(uhren.start);
           mikroKnopf.classList.add("hoert");  // Knopf wird rot
           mikroKnopf.textContent = "⏹";
-          meldungZeigen("Ich höre zu … bitte ein Wort sagen.", false);
+          meldungZeigen("Ich höre zu … bitte ein Wort sagen. (Nochmal tippen = fertig)", false);
+          mikroHinweisZeigen("");
         };
 
         erkennung.onresult = (ereignis) => {
-          const gesagt = ereignis.results[0][0].transcript;
-          const wort = erstesWort(gesagt, sprache);
-          if (!wort) { meldungZeigen("Ich habe kein Wort verstanden.", true); return; }
-          wortFeld.value = wort;
-          // Suche automatisch starten (wie ein Druck auf "Nachschlagen")
-          if (formular.requestSubmit) formular.requestSubmit();
-          else formular.dispatchEvent(new Event("submit", { cancelable: true }));
+          // Alle Stücke zusammensetzen (fertige und vorläufige)
+          let text = "";
+          for (let i = 0; i < ereignis.results.length; i++) text += ereignis.results[i][0].transcript;
+          text = text.trim();
+          if (!text) return;
+          letzterText = text;
+          localStorage.setItem("mikroHatGeklappt", "1");
+          localStorage.removeItem("mikroGehtNicht");
+          mikroHinweisZeigen("Erkannt: „" + text + "“");
+          // Ein Endergebnis -> gleich fertig, sonst kurze Pause abwarten
+          const letztes = ereignis.results[ereignis.results.length - 1];
+          if (letztes.isFinal) abschliessen(); else pauseAbwarten();
         };
 
         erkennung.onerror = (ereignis) => {
-          const meldungen = {
-            "not-allowed": "Das Mikrofon ist nicht erlaubt. Bitte in den Einstellungen erlauben " +
-                           "(iPhone: Diktierfunktion/Siri muss eingeschaltet sein).",
-            "service-not-allowed": "Spracherkennung ist nicht verfügbar. Auf dem iPhone die " +
-                                   "Diktierfunktion einschalten oder das Tastatur-Mikrofon benutzen.",
-            "no-speech": "Ich habe nichts gehört. Bitte nochmal versuchen.",
-            "audio-capture": "Kein Mikrofon gefunden.",
-            "network": "Für die Spracherkennung braucht es Internet.",
-          };
-          if (ereignis.error !== "aborted")
-            meldungZeigen(meldungen[ereignis.error] || "Spracherkennung fehlgeschlagen (" + ereignis.error + ").", true);
-          mikroZuruecksetzen();
+          if (ereignis.error === "aborted") return;        // haben wir selbst ausgelöst
+          if (ereignis.error === "no-speech" && letzterText) { abschliessen(); return; }
+          if (alsApp && (ereignis.error === "service-not-allowed" || ereignis.error === "not-allowed"))
+            localStorage.setItem("mikroGehtNicht", String(Date.now()));
+          abschliessen(FEHLER_MELDUNGEN[ereignis.error] ||
+                       "Die Spracherkennung hat nicht geklappt (" + ereignis.error + ").");
         };
 
-        erkennung.onend = mikroZuruecksetzen;   // fertig -> Knopf wieder normal
+        // Ende: das Gehörte benutzen (iOS liefert oft erst hier bzw. nur Zwischenergebnisse)
+        erkennung.onend = () => abschliessen();
+
+        // Startkontrolle: kommt nach 3 Sekunden kein "onstart", geht es hier nicht
+        uhren.start = setTimeout(() => {
+          if (gestartet) return;
+          if (alsApp) localStorage.setItem("mikroGehtNicht", String(Date.now()));
+          abschliessen("Die Spracherkennung startet nicht." +
+                       (alsApp ? " Als App vom Home-Bildschirm geht sie auf iPhone/iPad oft nicht – " +
+                                 "bitte die Seite in Safari öffnen." : ""));
+          mikroHinweisZeigen(TASTATUR_TIPP);
+        }, 3000);
+        // Nichts gehört: nach 6 Sekunden ohne Ergebnis aufhören
+        uhren.stille = setTimeout(() => {
+          if (!letzterText) abschliessen(FEHLER_MELDUNGEN["no-speech"]);
+        }, 6000);
+        // Höchstdauer: nach 10 Sekunden auf jeden Fall auswerten
+        uhren.max = setTimeout(() => abschliessen(), 10000);
 
         try {
-          erkennung.start();
+          erkennung.start();   // direkt im Tipp-Ereignis starten (wichtig für iOS)
         } catch (e) {
-          meldungZeigen("Spracherkennung konnte nicht starten.", true);
-          mikroZuruecksetzen();
+          abschliessen("Die Spracherkennung konnte nicht starten.");
+          mikroHinweisZeigen(TASTATUR_TIPP);
         }
       });
     }
+
+    // ---------------------------------------------------------------
+    // Diktieren mit dem Tastatur-Mikrofon: automatisch nachschlagen.
+    // Beim normalen Tippen kommt jeder Buchstabe einzeln – beim Diktieren (oder
+    // Einfügen) kommen mehrere Buchstaben auf einmal. Nur dann suchen wir
+    // nach 1,5 Sekunden Pause automatisch.
+    // ---------------------------------------------------------------
+    let diktierUhr = null;
+    let zuletztGesucht = "";
+    wortFeld.addEventListener("input", (ereignis) => {
+      clearTimeout(diktierUhr);
+      const stueck = ereignis.data || "";
+      const vieleZeichen = stueck.length >= 2 || ereignis.inputType === "insertFromPaste" ||
+                           ereignis.inputType === "insertReplacementText";
+      if (!vieleZeichen) return;
+      diktierUhr = setTimeout(() => {
+        const wort = wortSaeubern(wortFeld.value);
+        if (!wort || wort === zuletztGesucht || knopf.disabled) return;
+        zuletztGesucht = wort;
+        if (formular.requestSubmit) formular.requestSubmit();
+        else formular.dispatchEvent(new Event("submit", { cancelable: true }));
+      }, 1500);
+    });
+    // Wer selbst "Nachschlagen" drückt, braucht keine automatische Suche mehr
+    formular.addEventListener("submit", () => {
+      clearTimeout(diktierUhr);
+      zuletztGesucht = wortSaeubern(wortFeld.value);
+    });
 
     // Letzte gewählte Sprache merken (bleibt im Browser gespeichert)
     spracheFeld.value = localStorage.getItem("sprache") || "de";
