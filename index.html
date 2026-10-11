@@ -94,6 +94,10 @@
     details { margin-top: 14px; font-size: 0.9em; color: #444; }
     summary { cursor: pointer; color: #2b5797; padding: 8px 0; }
     .hinweis { color: #777; font-size: 0.8em; margin-top: 14px; }
+    /* Knöpfe für die Einzelwörter einer Wortgruppe */
+    .einzelwoerter { margin-top: 14px; color: #555; }
+    .einzelwort { font-size: 1em; margin: 4px 6px 0 0; padding: 8px 14px; border-radius: 18px;
+                  border: 1px solid #bbb; background: #f4f4f4; color: #222; }
   </style>
 </head>
 <body>
@@ -281,7 +285,7 @@
           const ziel = (link.getAttribute("href") || "").split("/wiki/")[1] || "";
           const grundform = decodeURIComponent(ziel.split("#")[0]).replace(/_/g, " ");
           if (grundform) return { grundform, beschreibung: formAufDeutsch(htmlEntfernen(html)),
-                                  art: eintrag.partOfSpeech };
+                                  art: eintrag.partOfSpeech, roh: htmlEntfernen(html) };
         }
       }
       return null;
@@ -413,7 +417,126 @@
     }
 
     // ---------------------------------------------------------------
-    // Die ganze Suche: Artikel weg, Wortgruppe, einzelne Wörter, Grundform
+    // ---------------------------------------------------------------
+    // Wortgruppen ("assert itself", "je me souviens", "setzt sich durch"):
+    // Im Wörterbuch stehen sie in einer Grundform ("assert oneself",
+    // "se souvenir", "sich durchsetzen"). Diese Formen bauen wir hier.
+    // ---------------------------------------------------------------
+    const SUBJEKTE = {
+      en: ["i", "you", "he", "she", "it", "we", "they"],
+      fr: ["je", "j'", "tu", "il", "elle", "on", "nous", "vous", "ils", "elles"],
+      es: ["yo", "tú", "él", "ella", "usted", "nosotros", "nosotras", "vosotros", "vosotras", "ellos", "ellas", "ustedes"],
+      de: ["ich", "du", "er", "sie", "es", "wir", "ihr", "man"],
+    };
+    // Trennbare Vorsilben deutscher Verben ("setzt sich durch" -> "durchsetzen")
+    const VORSILBEN_DE = ["ab", "an", "auf", "aus", "bei", "dar", "durch", "ein", "fest", "fort", "her", "heraus",
+                          "hin", "los", "mit", "nach", "vor", "vorbei", "weg", "weiter", "zu", "zurück",
+                          "zusammen", "um", "über", "wieder"];
+
+    // Grundform eines (gebeugten) Verbs: "souviens" -> "souvenir", "acuerdo" -> "acordar"
+    async function verbGrundform(wort, sprache) {
+      try {
+        const daten = await datenHolen(wort);
+        const verben = (daten[sprache] || []).filter(e => e.partOfSpeech === "Verb");
+        const form = formVerweis(verben);
+        if (form) return form.grundform;
+        if (verben.length) return wort;                 // ist schon die Grundform
+      } catch (e) {
+        if (!(e instanceof WortNichtGefunden)) throw e;
+      }
+      return null;
+    }
+
+    // Französisch: "se" vor Vokal/h wird zu "s'" ("s'en aller", "s'habiller")
+    const seVor = rest => (/^[aeiouhâàéèêîôûœ]/i.test(rest) ? "s'" : "se ") + rest;
+
+    // Liefert mögliche Wörterbuchformen einer Eingabe (ohne die Eingabe selbst)
+    async function phrasenVarianten(text, sprache) {
+      const ergebnis = [];
+      let woerter = text.split(" ");
+      // Subjekt am Anfang weg ("je me souviens" -> "me souviens"); bei "j'" hängt es am Wort
+      if (woerter.length > 1 && SUBJEKTE[sprache].includes(woerter[0].toLowerCase())) woerter = woerter.slice(1);
+      else if (sprache === "fr" && /^j'/i.test(woerter[0]) && woerter.length > 1) woerter[0] = woerter[0].slice(2);
+
+      if (sprache === "en") {
+        // itself/himself/... -> oneself, his/her/my/... -> one's (nicht am Anfang)
+        const neu = woerter.map((w, i) => {
+          if (/^(myself|yourself|himself|herself|itself|ourselves|yourselves|themselves)$/i.test(w)) return "oneself";
+          if (i > 0 && /^(my|your|his|her|its|our|their)$/i.test(w)) return "one's";
+          return w;
+        });
+        ergebnis.push(neu.join(" "));
+        // Gebeugtes erstes Verb: "loses his temper" -> "lose one's temper"
+        if (neu.length > 1) {
+          const grund = await verbGrundform(neu[0].toLowerCase(), sprache);
+          if (grund && grund !== neu[0].toLowerCase()) ergebnis.push([grund, ...neu.slice(1)].join(" "));
+        }
+      } else if (sprache === "fr") {
+        // "me souviens" / "m'en vais" -> "se souvenir" / "s'en aller"
+        let rest = null;
+        if (/^(me|te|se|nous|vous)$/i.test(woerter[0]) && woerter.length > 1) rest = woerter.slice(1);
+        else if (/^[mts]'./i.test(woerter[0])) rest = [woerter[0].slice(2), ...woerter.slice(1)];
+        if (rest) {
+          const vorne = /^(en|y)$/i.test(rest[0]) && rest.length > 1 ? [rest[0]] : [];
+          const verb = rest[vorne.length];
+          const hinten = rest.slice(vorne.length + 1);
+          ergebnis.push(seVor(rest.join(" ")));
+          const grund = await verbGrundform(verb.toLowerCase(), sprache);
+          if (grund) ergebnis.push(seVor([...vorne, grund, ...hinten].join(" ")));
+        } else if (woerter.join(" ") !== text) {
+          ergebnis.push(woerter.join(" "));
+        }
+      } else if (sprache === "es") {
+        // "acordarme" -> "acordarse", "darme cuenta" -> "darse cuenta"
+        const angehaengt = woerter[0].match(/^(.+(?:ar|er|ir|ár|ér|ír))(me|te|nos|os)$/i);
+        if (angehaengt) ergebnis.push([angehaengt[1] + "se", ...woerter.slice(1)].join(" "));
+        // "me acuerdo" -> "acordarse", "me doy cuenta" -> "darse cuenta"
+        if (/^(me|te|se|nos|os)$/i.test(woerter[0]) && woerter.length > 1) {
+          const grund = await verbGrundform(woerter[1].toLowerCase(), sprache);
+          if (grund) ergebnis.push([grund + "se", ...woerter.slice(2)].join(" "));
+        } else if (woerter.join(" ") !== text) {
+          ergebnis.push(woerter.join(" "));
+        }
+      } else if (sprache === "de") {
+        // mich/dich/uns/euch -> sich; "setzt sich durch" -> "sich durchsetzen"
+        const neu = woerter.map(w => /^(mich|dich|uns|euch|mir|dir)$/i.test(w) ? "sich" : w);
+        const ohneSich = neu.filter(w => w.toLowerCase() !== "sich");
+        const mitSich = ohneSich.length < neu.length;
+        if (ohneSich.length === 2 && VORSILBEN_DE.includes(ohneSich[1].toLowerCase())) {
+          const grund = await verbGrundform(ohneSich[0].toLowerCase(), sprache);
+          if (grund) {
+            const verb = ohneSich[1].toLowerCase() + grund;
+            if (mitSich) ergebnis.push("sich " + verb);
+            ergebnis.push(verb);
+          }
+        }
+        if (mitSich) {
+          ergebnis.push(["sich", ...ohneSich].join(" "));
+          ergebnis.push(ohneSich.join(" "));           // "sich durchsetzen" steht unter "durchsetzen"
+        }
+      }
+      return [...new Set(ergebnis)].filter(v => v && v !== text);
+    }
+
+    // Wiktionary-Suche nach Seiten, deren Titel ALLE Wörter enthalten
+    // ("assert oneself" für "assert itself"); bester Treffer = wenigste zusätzliche Wörter
+    async function phraseSuchen(phrase) {
+      const woerter = phrase.toLowerCase().split(" ").filter(Boolean);
+      const adresse = "https://en.wiktionary.org/w/api.php?action=query&list=search&srprop=&srlimit=20" +
+                      "&format=json&formatversion=2&origin=*&srsearch=" +
+                      encodeURIComponent(woerter.map(w => "intitle:" + w.replace(/["']/g, "")).join(" "));
+      const daten = await jsonHolen(adresse);
+      return ((daten && daten.query && daten.query.search) || [])
+        .map(e => e.title)
+        .filter(t => {
+          const teile = t.toLowerCase().split(/\s+/);
+          return teile.length > 1 && woerter.every(w => teile.includes(w)) && teile.length <= woerter.length + 2;
+        })
+        .sort((a, b) => a.split(" ").length - b.split(" ").length)
+        .slice(0, 3);
+    }
+
+    // Die ganze Suche: Artikel weg, Wortgruppe, Wörterbuchform der Gruppe, Grundform
     // Gibt zurück: { gefunden, eintraege, hinweise: [...] }
     // ---------------------------------------------------------------
     // Beschreibt eine Wortform auf Deutsch ("plural of maison" -> "Mehrzahl").
@@ -443,34 +566,61 @@
 
       // Reihenfolge der Versuche:
       // 1. ohne Artikel ("maison"), 2. so wie eingegeben,
-      // 3. bei mehreren Wörtern: jedes Wort einzeln (ohne Artikel)
-      const versuche = [gesucht, eingabe];
+      // 3. Wörterbuchform der Wortgruppe ("assert itself" -> "assert oneself",
+      //    "me acuerdo" -> "acordarse", "setzt sich durch" -> "sich durchsetzen")
+      // 4. Wiktionary-Suche nach Titeln mit allen Wörtern
+      // 5. nichts gefunden: die ganze Wortgruppe übersetzen (NICHT einfach das erste Wort zeigen)
       const woerter = gesucht.split(" ");
-      if (woerter.length > 1) {
-        for (const w of woerter.slice(0, 3)) {
-          const ohne = artikelEntfernen(w, sprache);
-          if (!ARTIKEL[sprache].includes(ohne.toLowerCase())) versuche.push(ohne);
-        }
-      }
-
       let treffer = null;
       let versuch = "";
-      for (versuch of [...new Set(versuche)]) {
-        treffer = await eintraegeSuchen(versuch, sprache);
-        if (treffer) break;
+      let wortgruppe = false;               // über die Wörterbuchform gefunden?
+      const probieren = async (liste) => {
+        for (versuch of [...new Set(liste)]) {
+          treffer = await eintraegeSuchen(versuch, sprache);
+          if (treffer) return true;
+        }
+        return false;
+      };
+      // Spanisch "acordarme" -> zuerst "acordarse" (sonst landet man beim nicht-reflexiven "acordar")
+      const zuerst = [];
+      if (sprache === "es" && !gesucht.includes(" ") && /(ar|er|ir|ár|ér|ír)(me|te|nos|os)$/i.test(gesucht)) {
+        zuerst.push(gesucht.replace(/(me|te|nos|os)$/i, "se"));
+        wortgruppe = await probieren(zuerst);
+      }
+      if (!wortgruppe && !await probieren([gesucht, eingabe])) {
+        const varianten = await phrasenVarianten(gesucht, sprache);
+        wortgruppe = await probieren(varianten);
+        if (!wortgruppe && woerter.length > 1) {
+          // Suche mit der Wörterbuchform (falls es eine gibt), sonst mit der Eingabe
+          for (const p of [...new Set([varianten[0] || gesucht, gesucht])]) {
+            wortgruppe = await probieren(await phraseSuchen(p));
+            if (wortgruppe) break;
+          }
+        }
+      }
+      if (!treffer && woerter.length > 1) {
+        // Kein Eintrag für die Wortgruppe: ganze Gruppe übersetzen, Einzelwörter nur als Knöpfe
+        const einzel = woerter.filter(w => !ARTIKEL[sprache].includes(w.toLowerCase())).slice(0, 4);
+        return { gefunden: gesucht, eintraege: [], hinweise: ["Für „" + gesucht +
+                 "“ gibt es keinen eigenen Wörterbucheintrag – hier die Übersetzung der ganzen Wortgruppe."],
+                 wahl: null, wortgruppe: { einzel } };
       }
       if (!treffer) throw new WortNichtGefunden();
 
       // Hinweise sammeln, damit klar ist, was wirklich gesucht wurde
       if (versuch !== eingabe) {
-        if (woerter.length > 1 && versuch !== gesucht)
-          hinweise.push("Die Wortgruppe „" + gesucht + "“ gibt es nicht – gezeigt wird „" + versuch + "“.");
+        if (wortgruppe)
+          hinweise.push("Eingegeben: „" + eingabe + "“ – im Wörterbuch als „" + versuch + "“");
         else
           hinweise.push("Eingegeben: „" + eingabe + "“ – gesucht: „" + versuch + "“");
       }
       if (ohneAkzente(treffer.gefunden) === ohneAkzente(versuch) &&
           treffer.gefunden.toLowerCase() !== versuch.toLowerCase())
         hinweise.push("Eingegeben: „" + versuch + "“ – gefunden als „" + treffer.gefunden + "“");
+
+      // Reflexiv gemeint ("sich durchsetzen", "se souvenir", "assert oneself")?
+      // Dann zeigen wir die reflexiven Bedeutungen zuerst.
+      const reflexiv = /(^|\s)(sich|se|oneself)(\s|$)|^s'/i.test(eingabe) || /(^|\s)(sich|se|oneself)(\s|$)|^s'/i.test(versuch);
 
       // Hat das Wort eigene Bedeutungen? Dann diese zeigen (passende Wortart zuerst).
       // Nur wenn es NUR eine Form ist ("maisons", "went"), holen wir die Grundform.
@@ -494,7 +644,20 @@
         // Nur nach der Wortart filtern, wenn klar ist, welche gemeint ist
         return { gefunden: treffer.gefunden, eintraege: wahl.eintraege, hinweise,
                  wahl: { art: wahl.art, filtern: !!vorliebe || wahl.arten === 1, streng: !!vorliebe,
-                         artikel: vorliebe === "nomen" ? artikel : "" } };
+                         artikel: vorliebe === "nomen" ? artikel : "", reflexiv } };
+      }
+      // Spanisch "acordarse" = "acordar combined with se": das reflexive Verb behalten
+      // (de.wiktionary hat dafür eigene Einträge: acordarse = sich erinnern)
+      if (form && sprache === "es" && /combined with (se|me|te|nos|os)\b/.test(form.roh || "")) {
+        const reflexivForm = treffer.gefunden.replace(/(me|te|nos|os)$/i, "se");
+        try {
+          const daten = await datenHolen(form.grundform);
+          hinweise.push("„" + reflexivForm + "“ ist die reflexive Form von „" + form.grundform + "“");
+          return { gefunden: reflexivForm, eintraege: (daten[sprache] || []).filter(e => e.partOfSpeech === "Verb"),
+                   hinweise, wahl: { art: "Verb", filtern: true, streng: false, artikel: "", reflexiv: true } };
+        } catch (e) {
+          if (!(e instanceof WortNichtGefunden)) throw e;
+        }
       }
       if (form) {
         try {
@@ -808,9 +971,10 @@
         ? [{ wort: gefunden, art }, ...stichListe.filter(x => x.wort.toLowerCase() !== gefunden.toLowerCase())]
         : stichListe;
       const stichwoerter = liste.map(x => x.wort);
+      // (Rückwärtssuche nicht bei Wortgruppen: die findet dort oft nur ungefähr Passendes)
       const [tabelle, rueck] = await Promise.all([
         stichwoerter.length ? deutschUeberEnglisch(stichwoerter, art) : null,
-        rueckwaertsSuchen(gefunden, sprache),
+        gefunden.includes(" ") ? null : rueckwaertsSuchen(gefunden, sprache),
       ]);
       if (tabelle) {
         // Die Rückwärtssuche liefert oft auch verwandte Wörter ("Sitzgelegenheit").
@@ -828,9 +992,33 @@
         quelle: "Quelle: de.wiktionary.org – deutsche Einträge, die „" + gefunden +
                 "“ als " + SPRACHEN[sprache] + "-Übersetzung nennen" };
 
+      // Wortgruppe ohne Eintrag: gibt es bei Tatoeba genau diesen Satz ("Take care!")?
+      // Dann ist dessen deutsche Übersetzung von Menschen gemacht.
+      if (!eintraege.length && gefunden.includes(" ")) {
+        const satz = await tatoebaGanzerSatz(gefunden, sprache);
+        if (satz) return { zeilen: [{ text: satz.deutsch }],
+          quelle: "Quelle: tatoeba.org (Satz „" + satz.text + "“)" };
+      }
       const mt = await maschinellUebersetzen(gefunden, sprache);
-      if (mt) return { zeilen: [{ text: mt }], quelle: "Maschinelle Übersetzung (MyMemory) – kann ungenau sein" };
+      if (mt) return { zeilen: [{ text: mt }], quelle: (gefunden.includes(" ")
+        ? "Maschinelle Übersetzung der ganzen Wortgruppe (MyMemory)" : "Maschinelle Übersetzung (MyMemory)") +
+        " – kann ungenau sein" };
       return { zeilen: [], quelle: "" };
+    }
+
+    // Tatoeba-Satz, der GENAU aus der Wortgruppe besteht ("Take care." für "take care")
+    async function tatoebaGanzerSatz(phrase, sprache) {
+      const nurWoerter = t => t.toLowerCase().replace(/[^\p{L}\p{N}' ]+/gu, " ").replace(/\s+/g, " ").trim();
+      const adresse = TATOEBA_ADRESSE + "&lang=" + TATOEBA_SPRACHE[sprache] + "&q=" +
+                      encodeURIComponent('"' + phrase + '"') + "&" + encodeURIComponent("trans:lang") + "=deu";
+      const daten = await jsonHolen(adresse, false);
+      for (const s of ((daten && daten.data) || [])) {
+        if (nurWoerter(s.text) !== nurWoerter(phrase)) continue;
+        const uebers = (s.translations || []).filter(t => t.lang === "deu");
+        const beste = uebers.find(t => t.is_direct) || uebers[0];
+        if (beste) return { text: s.text, deutsch: beste.text };
+      }
+      return null;
     }
 
     // ---------------------------------------------------------------
@@ -882,14 +1070,20 @@
       const deBeispiele = (deEintrag && deEintrag.beispiele) || [];
       if (sprache === "de") {
         // Zitate aus Zeitungen/Büchern stehen in „…“ und sind oft lang -> lieber einfache Sätze
-        const b = deBeispiele.find(x => kurz(x) && !x.text.startsWith("„"));
+        // Reflexiv gemeint ("sich durchsetzen")? Dann lieber ein Satz mit "sich"
+        const refl = x => !(wahl && wahl.reflexiv) || /\bsich\b/i.test(x.text);
+        const b = deBeispiele.find(x => kurz(x) && !x.text.startsWith("„") && refl(x)) ||
+                  deBeispiele.find(x => kurz(x) && !x.text.startsWith("„"));
         if (b) return { satz: b.text, deutsch: "", quelle: "Quelle: de.wiktionary.org" };
       } else {
         const b = deBeispiele.find(x => x.unterzeilen.length && kurz(x));
         if (b) return { satz: b.text, deutsch: b.unterzeilen[0], quelle: "Quelle: de.wiktionary.org" };
       }
 
-      const formen = [...new Set([gefunden, eingabe.toLowerCase() === gefunden.toLowerCase() ? gefunden : eingabe])];
+      // Auch die Eingabe selbst suchen ("assert itself" findet mehr Sätze als "assert oneself")
+      const ohneArtikel = artikelEntfernen(eingabe, sprache);
+      const formen = [...new Set([gefunden, eingabe.toLowerCase() === gefunden.toLowerCase() ? gefunden : eingabe,
+                                  ...(ohneArtikel.includes(" ") ? [ohneArtikel] : [])])];
       // Nomen (Wortart klar): zuerst Sätze mit Artikel davor suchen
       const phrasen = [];
       if (wahl && wahl.filtern && wahl.art === "Noun" && SATZ_ARTIKEL[sprache]) {
@@ -897,6 +1091,12 @@
         for (const a of artikelListe) {
           phrasen.push(a.endsWith("'") ? '"=' + a + gefunden + '"' : '"=' + a + " =" + gefunden + '"');
         }
+      }
+      // "assert oneself" kommt in echten Sätzen als "assert himself/herself/..." vor
+      if (sprache === "en" && /\b(oneself|one's)\b/.test(gefunden)) {
+        const ersatz = /\boneself\b/.test(gefunden) ? ["himself", "herself", "itself", "myself", "yourself", "themselves"]
+                                                    : ["his", "her", "my", "your", "their"];
+        phrasen.push(ersatz.map(p => '"' + gefunden.replace(/\b(oneself|one's)\b/, p) + '"').join(" | "));
       }
       const tatoeba = await tatoebaBeispiel(formen, sprache, phrasen.slice(0, 3));
       if (tatoeba) return tatoeba;
@@ -920,6 +1120,12 @@
       let satz = kandidaten.length ? kandidaten[0] : null;
       if (!satz) satz = await zitatAusWiktionary(gefunden, sprache);
       if (!satz) satz = await satzAusWikipedia(gefunden, sprache);
+      if (!satz && ohneArtikel.includes(" ") && ohneArtikel !== gefunden) satz = await satzAusWikipedia(ohneArtikel, sprache);
+      // "assert oneself" steht in Texten als "assert itself/himself"
+      for (const p of ["itself", "himself"]) {
+        if (!satz && sprache === "en" && /\boneself\b/.test(gefunden))
+          satz = await satzAusWikipedia(gefunden.replace(/\boneself\b/, p), sprache);
+      }
       if (!satz) return null;
       if (sprache === "de") return { satz: satz.satz, deutsch: "", quelle: "Quelle: " + satz.herkunft };
       const deutsch = await maschinellUebersetzen(satz.satz, sprache);
@@ -1055,7 +1261,7 @@
     // ---------------------------------------------------------------
     // Alles zusammen anzeigen
     // ---------------------------------------------------------------
-    async function ergebnisZeigen(gefunden, eingabe, sprache, eintraege, hinweise, wahl) {
+    async function ergebnisZeigen(gefunden, eingabe, sprache, eintraege, hinweise, wahl, wortgruppe) {
       ergebnis.innerHTML = "";   // altes Ergebnis löschen
       ergebnis.appendChild(neuesElement("h2", "", gefunden + " (" + SPRACHEN[sprache] + ")"));
       const wortartZeile = neuesElement("div", "wortart", "");
@@ -1093,11 +1299,28 @@
         }
       }
       klapp.appendChild(neuesElement("div", "hinweis", "Quelle: en.wiktionary.org"));
-      ergebnis.appendChild(klapp);
+      if (nummer) ergebnis.appendChild(klapp);      // ohne Eintrag (Wortgruppe) keine Erklärung
+
+      // Wortgruppe ohne Eintrag: Einzelwörter als Knöpfe zum Nachschlagen
+      if (wortgruppe && wortgruppe.einzel.length) {
+        const zeile = neuesElement("div", "einzelwoerter", "Einzelwörter: ");
+        for (const w of wortgruppe.einzel) {
+          const k = neuesElement("button", "einzelwort", w);
+          k.type = "button";
+          k.addEventListener("click", () => { wortFeld.value = w; formular.requestSubmit(); });
+          zeile.appendChild(k);
+        }
+        ergebnis.appendChild(zeile);
+      }
 
       // Deutsche Bedeutung zuerst (das Beispiel kann den de.wiktionary-Eintrag mitbenutzen)
       const bedeutung = await deutscheBedeutungFinden(gefunden, eingabe, sprache, eintraege, wahl);
       deInhalt.textContent = "";
+      // Reflexiv gemeint ("sich durchsetzen")? Dann die Bedeutungen mit "refl." nach vorne
+      if (wahl && wahl.reflexiv && bedeutung.eintrag) {
+        const refl = z => /^refl\.|reflexiv/i.test(z.text) ? 0 : 1;
+        bedeutung.zeilen = [...bedeutung.zeilen].sort((a, b) => refl(a) - refl(b));
+      }
       if (bedeutung.zeilen.length) {
         let letzteArt = null;
         bedeutung.zeilen.slice(0, 4).forEach((z, i) => {
@@ -1120,7 +1343,7 @@
       // (bei klarer Wortart diese, sonst die erste aus de.wiktionary bzw. en.wiktionary)
       const deArt = bedeutung.zeilen.find(z => z.wortart);
       const enArt = eintraege.find(e => e.partOfSpeech !== "Symbol");
-      wortartZeile.textContent = wahl && wahl.filtern ? wortartDeutsch(wahl.art)
+      wortartZeile.textContent = wortgruppe ? "Wortgruppe" : wahl && wahl.filtern ? wortartDeutsch(wahl.art)
         : (deArt ? deArt.wortart : (enArt ? wortartDeutsch(enArt.partOfSpeech) : ""));
 
       const beispiel = await beispielFinden(gefunden, eingabe, sprache, eintraege, bedeutung.eintrag, wahl);
@@ -1130,7 +1353,8 @@
         if (beispiel.deutsch) bspInhalt.appendChild(neuesElement("div", "uebersetzung", "Deutsch: " + beispiel.deutsch));
         bspQuelle.textContent = beispiel.quelle;
       } else {
-        bspInhalt.textContent = "Für dieses Wort habe ich keinen Beispielsatz gefunden.";
+        bspInhalt.textContent = wortgruppe ? "Für diese Wortgruppe habe ich keinen Beispielsatz gefunden."
+                                        : "Für dieses Wort habe ich keinen Beispielsatz gefunden.";
       }
     }
 
@@ -1159,8 +1383,8 @@
       meldungZeigen("Einen Moment, ich schlage nach …", false);
 
       try {
-        const { gefunden, eintraege, hinweise, wahl } = await nachschlagen(wort, sprache);
-        await ergebnisZeigen(gefunden, wort, sprache, eintraege, hinweise, wahl);
+        const { gefunden, eintraege, hinweise, wahl, wortgruppe } = await nachschlagen(wort, sprache);
+        await ergebnisZeigen(gefunden, wort, sprache, eintraege, hinweise, wahl, wortgruppe);
       } catch (e) {
         if (e instanceof WortNichtGefunden)
           meldungZeigen("Das Wort „" + wort + "“ wurde auf " + SPRACHEN[sprache] + " nicht gefunden.", true);
