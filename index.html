@@ -681,6 +681,7 @@
     // "conquering; winning" / "conqueror, conquistador" -> conquering, winning, conqueror, ...
     function englischeStichwoerter(eintraege) {
       const liste = [];
+      const kopfwoerter = [];
       let gezaehlt = 0;
       for (const eintrag of eintraege) {
         for (const definition of (eintrag.definitions || [])) {
@@ -693,10 +694,19 @@
             // Wortart merken, damit wir sie später (auf Deutsch) anzeigen können
             if (teil && teil.split(" ").length <= 3 && !liste.some(x => x.wort === teil))
               liste.push({ wort: teil, art: eintrag.partOfSpeech });
+            // Bei "brilliantly showy" auch das Hauptwort am Ende ("showy") merken –
+            // es kommt erst nach allen ganzen Stichwörtern dran (nicht bei Verben: "put off")
+            const teile = teil.split(" ");
+            const kopf = teile[teile.length - 1].toLowerCase();
+            if (teile.length >= 2 && teile.length <= 3 && eintrag.partOfSpeech !== "Verb" &&
+                kopf.length > 3 && !kopfwoerter.some(x => x.wort === kopf))
+              kopfwoerter.push({ wort: kopf, art: eintrag.partOfSpeech });
           }
         }
       }
-      return liste.slice(0, 8);
+      const alle = [...liste];
+      for (const k of kopfwoerter) if (!alle.some(x => x.wort === k.wort)) alle.push(k);
+      return alle.slice(0, 10);
     }
 
     const ARTIKEL_DE = { m: "der", f: "die", n: "das", p: "die" };
@@ -791,8 +801,12 @@
       // 3 = deutsche Einträge, die das Wort als Übersetzung nennen (Rückwärtssuche)
       // Ist die Wortart klar, nur deren Bedeutungen und Tabellen benutzen
       const art = wahl && wahl.filtern ? wahl.art : "";
-      const liste = sprache === "en" ? [{ wort: gefunden, art }]
-                  : englischeStichwoerter(art ? eintraege.filter(e => e.partOfSpeech === art) : eintraege);
+      // Englisch: zuerst die Tabelle des Wortes selbst, dann die seiner Erklärung
+      // ("glitzy" hat keine Tabelle -> "Brilliantly showy" -> "showy" = protzig, auffällig)
+      const stichListe = englischeStichwoerter(art ? eintraege.filter(e => e.partOfSpeech === art) : eintraege);
+      const liste = sprache === "en"
+        ? [{ wort: gefunden, art }, ...stichListe.filter(x => x.wort.toLowerCase() !== gefunden.toLowerCase())]
+        : stichListe;
       const stichwoerter = liste.map(x => x.wort);
       const [tabelle, rueck] = await Promise.all([
         stichwoerter.length ? deutschUeberEnglisch(stichwoerter, art) : null,
@@ -807,7 +821,7 @@
         const art = (liste.find(x => x.wort === tabelle.seite) || {}).art;
         return { zeilen: [{ text: tabelle.woerter.join(", "), wortart: art ? wortartDeutsch(art) : "" }],
           quelle: "Quelle: en.wiktionary.org – Übersetzungstabelle von „" + tabelle.seite + "“" +
-                  (sprache === "en" ? "" : " (über die englische Bedeutung)") +
+                  (tabelle.seite.toLowerCase() === gefunden.toLowerCase() ? "" : " (über die englische Bedeutung)") +
                   (bestaetigt.length ? "; bestätigt durch de.wiktionary („" + bestaetigt.join("“, „") + "“)" : "") };
       }
       if (rueck) return { zeilen: [{ text: rueck.join(", ") }],
@@ -892,20 +906,150 @@
         return { satz: b.text, deutsch: "", quelle: "Quelle: de.wiktionary.org" };
       }
 
-      // en.wiktionary-Beispiel (Originalsprache); die englische Übersetzung zeigen wir nicht
+      // Ab hier: echte Sätze OHNE menschliche deutsche Übersetzung -> maschinell übersetzen.
+      // Reihenfolge: en.wiktionary-Beispiel, en.wiktionary-Zitat, Wikipedia.
+      const kandidaten = [];
       for (const eintrag of eintraege) {
         for (const definition of (eintrag.definitions || [])) {
           for (const b of (definition.parsedExamples || [])) {
             const satz = htmlEntfernen(b.example);
-            if (!satz) continue;
-            if (sprache === "de") return { satz, deutsch: "", quelle: "Quelle: en.wiktionary.org" };
-            const deutsch = await maschinellUebersetzen(satz, sprache);
-            if (deutsch) return { satz, deutsch, quelle: "Satz: en.wiktionary.org – " +
-                                  "deutsche Übersetzung maschinell (MyMemory), kann ungenau sein" };
+            if (satz) kandidaten.push({ satz, herkunft: "en.wiktionary.org" });
           }
         }
       }
+      let satz = kandidaten.length ? kandidaten[0] : null;
+      if (!satz) satz = await zitatAusWiktionary(gefunden, sprache);
+      if (!satz) satz = await satzAusWikipedia(gefunden, sprache);
+      if (!satz) return null;
+      if (sprache === "de") return { satz: satz.satz, deutsch: "", quelle: "Quelle: " + satz.herkunft };
+      const deutsch = await maschinellUebersetzen(satz.satz, sprache);
+      if (deutsch) return { satz: satz.satz, deutsch, quelle: "Satz aus " + satz.herkunft +
+                            " – maschinell übersetzt (MyMemory), kann ungenau sein" };
+      return { satz: satz.satz, deutsch: "", quelle: "Satz aus " + satz.herkunft +
+               " – leider ohne deutsche Übersetzung (Übersetzungsdienst nicht erreichbar)" };
+    }
+
+    // ---------------------------------------------------------------
+    // Weitere Quellen für echte Sätze (ohne deutsche Übersetzung)
+    // ---------------------------------------------------------------
+
+    // Sucht in einem Text den besten Satz mit dem Wort:
+    // ganzes Wort, 6–30 Wörter, möglichst um die 14 Wörter lang.
+    function besterSatz(text, wort) {
+      const muster = new RegExp("(^|[^\\p{L}])" + wort.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") +
+                                "($|[^\\p{L}])", "iu");
+      // Genau so geschrieben (Groß-/Kleinschreibung) ist besser: "Le Débrouillard" ist ein Filmtitel
+      const genau = new RegExp("(^|[^\\p{L}])" + wort.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") +
+                               "($|[^\\p{L}])", "u");
+      // In Sätze teilen – aber nicht nach Abkürzungen wie "C. P." oder "z. B."
+      const saetze = text.replace(/\s+/g, " ").split(/(?<![\s.(]\p{L}\.)(?<=[.!?…])\s+(?=[\p{Lu}„"«¿¡])/u);
+      let bester = null;
+      for (let s of saetze) {
+        s = s.trim();
+        const anzahl = s.split(" ").length;
+        if (!muster.test(s) || anzahl < 6 || anzahl > 30 || /[{}=|\[\]]/.test(s)) continue;
+        if (!/^[\p{Lu}„"«¿¡]/u.test(s) || /^\p{Lu}\.\s/u.test(s)) continue;   // kein Satzanfang
+        // Anders geschrieben nur am Satzanfang erlaubt ("Glitzy …"), sonst ist es meist ein Name
+        if (!genau.test(s) && !s.toLowerCase().startsWith(wort.toLowerCase())) continue;
+        const abstand = Math.abs(anzahl - 14);
+        if (!bester || abstand < bester.abstand) bester = { satz: s, abstand };
+      }
+      return bester ? bester.satz : null;
+    }
+
+    // Liest die Teile einer Wiki-Vorlage {{name|a|b=c}} (mit verschachtelten Vorlagen)
+    function vorlagenTeile(innen) {
+      const teile = [];
+      let tiefe = 0, aktuell = "";
+      for (let i = 0; i < innen.length; i++) {
+        const z = innen[i], z2 = innen.slice(i, i + 2);
+        if (z2 === "{{" || z2 === "[[") { tiefe++; aktuell += z2; i++; continue; }
+        if ((z2 === "}}" || z2 === "]]") && tiefe > 0) { tiefe--; aktuell += z2; i++; continue; }
+        if (z === "|" && tiefe === 0) { teile.push(aktuell); aktuell = ""; continue; }
+        aktuell += z;
+      }
+      teile.push(aktuell);
+      return teile;
+    }
+
+    // Findet alle Vorlagen {{...}} der obersten Ebene in einem Text
+    function vorlagenFinden(text) {
+      const gefunden = [];
+      let tiefe = 0, start = -1;
+      for (let i = 0; i < text.length - 1; i++) {
+        const z2 = text.slice(i, i + 2);
+        if (z2 === "{{") { if (tiefe === 0) start = i; tiefe++; i++; }
+        else if (z2 === "}}" && tiefe > 0) { tiefe--; i++; if (tiefe === 0) gefunden.push(text.slice(start + 2, i - 1)); }
+      }
+      return gefunden;
+    }
+
+    // Wiki-Text eines Zitats lesbar machen: {{w|Olivia Dean}} -> Olivia Dean
+    function zitatSaeubern(text) {
+      let t = text;
+      // Von innen nach außen: Vorlagen, deren Text sichtbar bleibt, durch den Text ersetzen
+      // {{w|Olivia Dean|{{q-g|Olivia}} Dean}} -> "Olivia Dean"; {{l|en|word}} -> "word"
+      for (let runde = 0; runde < 5 && /\{\{[^{}]*\}\}/.test(t); runde++) {
+        t = t.replace(/\{\{([^{}]*)\}\}/g, (ganz, innen) => {
+          const teile = innen.split("|").filter(x => !x.includes("="));
+          const name = teile[0].trim();
+          if (name === "w") return teile[2] || teile[1] || "";
+          if (/^(l|m|lang|ll)$/.test(name)) return teile[3] || teile[2] || "";
+          if (/^(q-g|qualifier|gloss|nowrap)$/.test(name)) return teile[1] || "";
+          return "";                                   // alles andere weglassen
+        });
+      }
+      return wikiTextSaeubern(t);
+    }
+
+    // Quelle: Zitate und Beispiele im vollen en.wiktionary-Eintrag
+    // ({{quote-book|…|passage=…}}, {{ux|es|…}}), die die Kurzfassung nicht liefert
+    async function zitatAusWiktionary(wort, sprache) {
+      const seiten = await seitenHolen(EN_SEITEN_ADRESSE, [wort]);
+      if (!seiten[wort]) return null;
+      const teile = seiten[wort].split(new RegExp("^==" + SPRACH_UEBERSCHRIFT[sprache] + "==\\s*$", "m"));
+      if (teile.length < 2) return null;
+      const sprachTeil = teile[1].split(/^==[^=]/m)[0];
+      const texte = [];
+      for (const vorlage of vorlagenFinden(sprachTeil)) {
+        const t = vorlagenTeile(vorlage);
+        const name = t[0].trim();
+        if (/^quote-/.test(name)) {
+          const stelle = t.find(x => /^\s*(passage|text)\s*=/.test(x));
+          if (stelle) texte.push(stelle.replace(/^\s*(passage|text)\s*=/, ""));
+        } else if (/^(ux|uxi|usex|ux-lite)$/.test(name) && t[2]) {
+          texte.push(t[2]);
+        }
+      }
+      for (const roh of texte) {
+        const satz = besterSatz(zitatSaeubern(roh), wort);
+        if (satz) return { satz, herkunft: "en.wiktionary.org (Zitat)" };
+      }
       return null;
+    }
+
+    // Quelle: Wikipedia in der Sprache des Wortes (Volltextsuche, dann Artikeltext)
+    async function satzAusWikipedia(wort, sprache) {
+      const basis = "https://" + sprache + ".wikipedia.org/w/api.php?format=json&formatversion=2&origin=*";
+      const suche = await jsonHolen(basis + "&action=query&list=search&srwhat=text&srlimit=10&srprop=snippet" +
+                                    "&srsearch=" + encodeURIComponent('"' + wort + '"'));
+      // Treffer, deren Vorschau das Wort genau so geschrieben enthält, zuerst
+      // (sonst sind es oft Buchtitel in den Quellenangaben: „Bouquiner avec …“)
+      const treffer = (suche && suche.query && suche.query.search) || [];
+      const genauDrin = e => (e.snippet || "").includes('<span class="searchmatch">' + wort + "</span>");
+      const titel = [...treffer.filter(genauDrin), ...treffer.filter(e => !genauDrin(e))]
+                    .map(e => e.title).slice(0, 3);
+      // Die Artikel gleichzeitig holen (als reiner Text)
+      const texte = await Promise.all(titel.map(t => jsonHolen(basis +
+        "&action=query&prop=extracts&explaintext=1&exsectionformat=plain&redirects=1&titles=" + encodeURIComponent(t))));
+      let bester = null;
+      texte.forEach((daten, i) => {
+        const seite = daten && daten.query && daten.query.pages && daten.query.pages[0];
+        const satz = seite && seite.extract ? besterSatz(seite.extract, wort) : null;
+        if (satz && (!bester || Math.abs(satz.split(" ").length - 14) < Math.abs(bester.satz.split(" ").length - 14)))
+          bester = { satz, herkunft: sprache + ".wikipedia.org („" + titel[i] + "“)" };
+      });
+      return bester;
     }
 
     // ---------------------------------------------------------------
