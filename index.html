@@ -248,25 +248,101 @@
     // Dann holen wir lieber den Grundeintrag ("maison").
     // ---------------------------------------------------------------
 
-    // Gibt die Grundform zurück, wenn die ERSTE Bedeutung nur "Form von ..." ist
-    // (sonst null). Einträge wie "Symbol" (z. B. Sprachcodes) zählen nicht mit.
-    function grundformFinden(eintraege) {
+    // Veraltete oder seltene Bedeutungen ("(obsolete) a path" bei "went") zählen nicht
+    const SELTEN = /^\s*\([^)]*\b(obsolete|archaic|rare|dated|dialectal|nonstandard|nonce)\b/i;
+
+    // Die "eigenen" Bedeutungen eines Eintrags: keine "Form von", nichts Veraltetes
+    function eigeneBedeutungen(eintrag) {
+      if (eintrag.partOfSpeech === "Symbol") return [];         // Sprachcodes zählen nicht
+      // Ist die ERSTE Bedeutung "Mehrzahl von ..." ("manzanas" = Äpfel; danach erst "Tollpatsch"),
+      // dann ist der Eintrag hauptsächlich eine Form.
+      const erste = (eintrag.definitions || []).find(d => htmlEntfernen(d.definition || ""));
+      if (erste && erste.definition.includes("form-of-definition") &&
+          /plural/i.test(htmlEntfernen(erste.definition))) return [];
+      return (eintrag.definitions || []).filter(d => {
+        const html = d.definition || "";
+        const text = htmlEntfernen(html);
+        return text && !html.includes("form-of-definition") && !SELTEN.test(text);
+      });
+    }
+
+    // Sucht die erste "Form von ..."-Bedeutung und liest den Link zur Grundform.
+    // Gibt { grundform, beschreibung, art } zurück (oder null).
+    function formVerweis(eintraege) {
       for (const eintrag of eintraege) {
         if (eintrag.partOfSpeech === "Symbol") continue;
         for (const definition of (eintrag.definitions || [])) {
           const html = definition.definition || "";
-          if (!htmlEntfernen(html)) continue;                     // leere überspringen
-          if (!html.includes("form-of-definition")) return null;  // echte Bedeutung
+          if (!html.includes("form-of-definition")) continue;
           // Den Link zur Grundform lesen: <a href="/wiki/maison#French">
           const dokument = new DOMParser().parseFromString(html, "text/html");
           const link = dokument.querySelector(".form-of-definition-link a");
-          if (!link) return null;
+          if (!link) continue;
           const ziel = (link.getAttribute("href") || "").split("/wiki/")[1] || "";
           const grundform = decodeURIComponent(ziel.split("#")[0]).replace(/_/g, " ");
-          return grundform ? { grundform, beschreibung: formAufDeutsch(htmlEntfernen(html)) } : null;
+          if (grundform) return { grundform, beschreibung: formAufDeutsch(htmlEntfernen(html)),
+                                  art: eintrag.partOfSpeech };
         }
       }
       return null;
+    }
+
+    // Grundform nur dann, wenn das Wort KEINE eigene Bedeutung hat
+    // ("maisons" = nur Mehrzahl von "maison"; "reckoning" hat dagegen ein eigenes Nomen).
+    function grundformFinden(eintraege) {
+      if (eintraege.some(e => eigeneBedeutungen(e).length)) return null;
+      return formVerweis(eintraege);
+    }
+
+    // Wählt die Wortart, die gezeigt wird.
+    // vorliebe = "nomen" (es stand ein Artikel davor: "the reckoning", "das Essen")
+    //          = "verb"  (es stand "to" davor: "to reckon")
+    //          = ""      (keine Vorliebe -> Reihenfolge wie im Wiktionary)
+    // Gibt { art, eintraege (gewählte Wortart zuerst), arten (Anzahl eigener Wortarten) } zurück.
+    function wortartWaehlen(eintraege, vorliebe) {
+      const eigene = eintraege.filter(e => eigeneBedeutungen(e).length);
+      if (!eigene.length) return null;
+      let haupt = eigene[0];
+      const reihenfolge = { nomen: ["Noun", "Adjective", "Proper noun"], verb: ["Verb"] }[vorliebe] || [];
+      for (const art of reihenfolge) {
+        const passend = eigene.find(e => e.partOfSpeech === art);
+        if (passend) { haupt = passend; break; }
+      }
+      const eigeneArten = [...new Set(eigene.map(e => e.partOfSpeech))];
+      return { art: haupt.partOfSpeech, eintraege: [haupt, ...eintraege.filter(e => e !== haupt)],
+               arten: eigeneArten.length, eigeneArten };
+    }
+
+    // Ist das Wort BEIDES (eine Form und ein eigenes Wort), schauen wir im Quelltext
+    // von Wiktionary nach, ob die eigenen Bedeutungen nur "Nebensache" sind:
+    // 1. Die erste Herkunft (Etymology 1) enthält NUR Formen, die eigenen Bedeutungen
+    //    stehen erst bei einer späteren Herkunft ("ate" = aß; "ate" = ältere Schwester auf Tagalog).
+    // 2. Alle eigenen Bedeutungen sind als veraltet/selten markiert ({{lb|en|obsolete}}),
+    //    was die Kurzfassung von Wiktionary leider weglässt ("went" = alter Weg).
+    const SPRACH_UEBERSCHRIFT = { en: "English", fr: "French", es: "Spanish", de: "German" };
+    const FORM_VORLAGE = /\{\{[^{}|]*(\bof|form of|\bform)\|/;   // {{plural of|...}}, {{infl of|...}}
+    async function eigeneNebensaechlich(wort, sprache, arten) {
+      const seiten = await seitenHolen(EN_SEITEN_ADRESSE, [wort]);
+      if (!seiten[wort]) return false;
+      const teile = seiten[wort].split(new RegExp("^==" + SPRACH_UEBERSCHRIFT[sprache] + "==\\s*$", "m"));
+      if (teile.length < 2) return false;
+      const sprachTeil = teile[1].split(/^==[^=]/m)[0];
+      const bedeutungsZeilen = text => text.split("\n").filter(z => /^#+\s/.test(z));
+
+      // Regel 1: mehrere Herkünfte, die erste nur mit Formen
+      const herkuenfte = sprachTeil.split(/^===\s*Etymology \d+\s*===\s*$/m).slice(1);
+      if (herkuenfte.length > 1) {
+        const erste = bedeutungsZeilen(herkuenfte[0]);
+        if (erste.length && erste.every(z => FORM_VORLAGE.test(z))) return true;
+      }
+      const zeilen = [];
+      for (const art of arten) {
+        const teil = wortartTeil(sprachTeil, art);
+        if (teil === sprachTeil) return false;       // Wortart nicht gefunden -> lieber nichts ändern
+        zeilen.push(...teil.split("\n").filter(z => /^#+\s/.test(z)));   // nur Bedeutungszeilen
+      }
+      return zeilen.length > 0 &&
+             zeilen.every(z => /\{\{(lb|lbl|label)\|[^}]*\b(obsolete|archaic|rare|dated|nonstandard)\b/.test(z));
     }
 
     // Groß-/Kleinschreibung: "Haus" und "haus" sind verschiedene Seiten.
@@ -357,7 +433,13 @@
 
     async function nachschlagen(eingabe, sprache) {
       const hinweise = [];
-      const gesucht = artikelEntfernen(eingabe, sprache);
+      let gesucht = artikelEntfernen(eingabe, sprache);
+      // Welcher Artikel stand davor? "to" -> Verb gemeint, sonst ein Nomen
+      const artikel = gesucht !== eingabe ? eingabe.slice(0, eingabe.length - gesucht.length).trim().toLowerCase() : "";
+      const vorliebe = artikel === "to" ? "verb" : (artikel ? "nomen" : "");
+      // Deutsch: nach einem Artikel ist ein Nomen gemeint -> groß schreiben ("das essen" -> "Essen")
+      if (sprache === "de" && vorliebe === "nomen" && !gesucht.includes(" "))
+        gesucht = gesucht.charAt(0).toUpperCase() + gesucht.slice(1);
 
       // Reihenfolge der Versuche:
       // 1. ohne Artikel ("maison"), 2. so wie eingegeben,
@@ -390,21 +472,45 @@
           treffer.gefunden.toLowerCase() !== versuch.toLowerCase())
         hinweise.push("Eingegeben: „" + versuch + "“ – gefunden als „" + treffer.gefunden + "“");
 
-      // Ist es nur eine Form (Mehrzahl, Verbform)? Dann die Grundform holen.
-      const form = grundformFinden(treffer.eintraege);
+      // Hat das Wort eigene Bedeutungen? Dann diese zeigen (passende Wortart zuerst).
+      // Nur wenn es NUR eine Form ist ("maisons", "went"), holen wir die Grundform.
+      let wahl = wortartWaehlen(treffer.eintraege, vorliebe);
+      // "Reine" Form-Einträge: alle Bedeutungen sind nur "Form von" (z. B. Verb "reckoning")
+      const form = formVerweis(treffer.eintraege.filter(e => !eigeneBedeutungen(e).length));
+      // Beides vorhanden? Sind die eigenen Bedeutungen nur veraltet ("went" = alter Weg),
+      // dann ist doch die Grundform ("go") gemeint.
+      if (wahl && form && await eigeneNebensaechlich(treffer.gefunden, sprache, wahl.eigeneArten)) wahl = null;
+      // Sonderfall "to ...": Verb gewünscht, aber das Verb ist nur eine Form -> Grundform
+      const verbNurForm = vorliebe === "verb" && wahl && wahl.art !== "Verb" && form && form.art === "Verb";
+      if (wahl && !verbNurForm) {
+        // Hinweis "ist auch eine Form von" nur bei echten Beugungsformen einer ANDEREN Wortart
+        // (also nicht bei "Alternative form of ..." und nicht "Essen" = Mehrzahl von "Esse")
+        if (form && form.grundform !== treffer.gefunden && form.beschreibung !== "gebeugte Form" &&
+            form.art !== wahl.art) {
+          const formArt = form.art === "Verb" || /Gerundium|Partizip|Verbform|Vergangenheit/.test(form.beschreibung)
+            ? "Verb" : wortartDeutsch(form.art);
+          hinweise.push("„" + treffer.gefunden + "“ ist auch eine Form von „" + form.grundform + "“ (" + formArt + ")");
+        }
+        // Nur nach der Wortart filtern, wenn klar ist, welche gemeint ist
+        return { gefunden: treffer.gefunden, eintraege: wahl.eintraege, hinweise,
+                 wahl: { art: wahl.art, filtern: !!vorliebe || wahl.arten === 1, streng: !!vorliebe,
+                         artikel: vorliebe === "nomen" ? artikel : "" } };
+      }
       if (form) {
         try {
           const daten = await datenHolen(form.grundform);
           if (daten[sprache]) {
             hinweise.push("„" + treffer.gefunden + "“ ist eine Form von „" + form.grundform +
                           "“ (" + form.beschreibung + ")");
-            return { gefunden: form.grundform, eintraege: daten[sprache], hinweise };
+            const wahl2 = wortartWaehlen(daten[sprache], vorliebe || (form.art === "Verb" ? "verb" : "nomen"));
+            return { gefunden: form.grundform, eintraege: wahl2 ? wahl2.eintraege : daten[sprache], hinweise,
+                     wahl: wahl2 ? { art: wahl2.art, filtern: false, streng: false } : null };
           }
         } catch (e) {
           if (!(e instanceof WortNichtGefunden)) throw e;
         }
       }
-      return { gefunden: treffer.gefunden, eintraege: treffer.eintraege, hinweise };
+      return { gefunden: treffer.gefunden, eintraege: treffer.eintraege, hinweise, wahl: null };
     }
 
     // ---------------------------------------------------------------
@@ -531,14 +637,31 @@
 
     // Quelle 1: der passende Eintrag im deutschen Wiktionary
     // Gibt { titel, bedeutungen, beispiele } zurück (oder null)
-    async function deutschenEintragHolen(varianten, sprache) {
+    // Englische Wortart (en.wiktionary) -> Namen im deutschen Wiktionary
+    const DE_WORTARTEN = {
+      "Noun": ["Substantiv"], "Verb": ["Verb"], "Adjective": ["Adjektiv"], "Adverb": ["Adverb"],
+      "Proper noun": ["Eigenname", "Toponym", "Vorname", "Nachname"],
+      "Interjection": ["Interjektion"], "Participle": ["Partizip I", "Partizip II"],
+    };
+
+    // wahl = { art, filtern, streng } aus nachschlagen():
+    // filtern -> nur Bedeutungen/Beispiele der gewählten Wortart zeigen
+    // streng  -> passt keine, lieber die nächste Quelle fragen (statt einer falschen Wortart)
+    async function deutschenEintragHolen(varianten, sprache, wahl) {
+      const namen = wahl && wahl.filtern ? DE_WORTARTEN[wahl.art] : null;
+      const passt = b => !namen || namen.includes(b.wortart);
       const seiten = await seitenHolen(DE_ADRESSE, varianten);
       for (const titel of varianten) {
         if (!seiten[titel]) continue;
         const abschnitt = sprachAbschnitt(seiten[titel], SPRACHEN[sprache]);
         if (!abschnitt) continue;
-        const bedeutungen = blockLesen(abschnitt, "Bedeutungen");
-        if (bedeutungen.length) return { titel, bedeutungen, beispiele: blockLesen(abschnitt, "Beispiele") };
+        const alle = blockLesen(abschnitt, "Bedeutungen");
+        const beispiele = blockLesen(abschnitt, "Beispiele");
+        if (!alle.length) continue;
+        const bedeutungen = alle.filter(passt);
+        if (bedeutungen.length) return { titel, bedeutungen, beispiele: beispiele.filter(passt) };
+        // Keine passende Wortart: nur nehmen, wenn wir nicht streng sein müssen
+        if (!wahl || !wahl.streng) return { titel, bedeutungen: alle, beispiele };
       }
       return null;
     }
@@ -582,6 +705,9 @@
     function deutscheUebersetzungen(wikitext) {
       let sinn = "";
       let ungeprueft = false;
+      const alle = [];
+      let ersterSinn = "";
+      let tabellen = 0;
       for (const zeile of wikitext.split("\n")) {
         const kopf = zeile.match(/\{\{(trans-top|checktrans-top)[^|}]*\|?([^|}]*)/);
         if (kopf) {
@@ -599,14 +725,31 @@
           // Artikel nur bei einzelnen Wörtern ("die Katze", aber "glücklicher Zufall")
           woerter.push(m[2] && !wort.includes(" ") ? ARTIKEL_DE[m[2]] + " " + wort : wort);
         }
-        if (woerter.length) return { woerter: [...new Set(woerter)].slice(0, 4), sinn };
+        if (!woerter.length) continue;
+        // Aus bis zu 3 Tabellen (Bedeutungen) je bis zu 3 Wörter sammeln
+        for (const w of woerter.slice(0, 3)) if (!alle.includes(w)) alle.push(w);
+        if (!ersterSinn) ersterSinn = sinn;
+        if (++tabellen >= 3) break;
       }
-      return null;
+      return alle.length ? { woerter: alle.slice(0, 6), sinn: ersterSinn } : null;
+    }
+
+    // Schneidet den Teil einer Wortart heraus (z. B. "===Noun===" bis zur nächsten Wortart).
+    // Gibt es die Wortart auf der Seite nicht, bleibt der Text, wie er ist.
+    function wortartTeil(wikitext, art) {
+      if (!art) return wikitext;
+      const zeilen = wikitext.split("\n");
+      const istArt = z => { const m = z.match(/^={3,5}\s*([^=]+?)\s*={3,5}\s*$/); return m && WORTARTEN[m[1]] ? m[1] : null; };
+      const start = zeilen.findIndex(z => istArt(z) === art);
+      if (start < 0) return wikitext;
+      let ende = zeilen.length;
+      for (let i = start + 1; i < zeilen.length; i++) if (istArt(zeilen[i])) { ende = i; break; }
+      return zeilen.slice(start, ende).join("\n");
     }
 
     // Quelle 3: Übersetzungstabellen im englischen Wiktionary.
     // Wir fragen alle Stichwörter (und ihre "/translations"-Unterseiten) auf einmal ab.
-    async function deutschUeberEnglisch(stichwoerter) {
+    async function deutschUeberEnglisch(stichwoerter, art) {
       const titel = [];
       for (const s of stichwoerter) titel.push(s + "/translations", s);
       const seiten = await seitenHolen(EN_SEITEN_ADRESSE, titel);
@@ -615,7 +758,7 @@
           if (!seiten[t]) continue;
           // Nur den englischen Teil der Seite nehmen (bis zur nächsten Sprache)
           const englisch = (seiten[t].split(/^==English==\s*$/m)[1] || seiten[t]).split(/^==[^=]/m)[0];
-          const gefunden = deutscheUebersetzungen(englisch);
+          const gefunden = deutscheUebersetzungen(wortartTeil(englisch, art));
           if (gefunden) return { ...gefunden, seite: s };
         }
       }
@@ -634,11 +777,11 @@
 
     // Sucht die deutsche Bedeutung in der Reihenfolge 1 -> 4.
     // Gibt { zeilen: [{text, wortart}], quelle, eintrag } zurück.
-    async function deutscheBedeutungFinden(gefunden, eingabe, sprache, eintraege) {
+    async function deutscheBedeutungFinden(gefunden, eingabe, sprache, eintraege, wahl) {
       const gross = gefunden.charAt(0).toUpperCase() + gefunden.slice(1);
       const varianten = [...new Set([gefunden, gross, gefunden.toLowerCase(), eingabe])];
 
-      const eintrag = await deutschenEintragHolen(varianten, sprache);
+      const eintrag = await deutschenEintragHolen(varianten, sprache, wahl);
       if (eintrag) return { zeilen: eintrag.bedeutungen, eintrag,
         quelle: "Quelle: de.wiktionary.org (Eintrag „" + eintrag.titel + "“)" };
       if (sprache === "de") return { zeilen: [], quelle: "" };   // Deutsch: nichts übersetzen
@@ -646,10 +789,13 @@
       // Quelle 2 und 3 gleichzeitig fragen (spart Zeit):
       // 2 = Übersetzungstabellen im englischen Wiktionary (über die englische Bedeutung)
       // 3 = deutsche Einträge, die das Wort als Übersetzung nennen (Rückwärtssuche)
-      const liste = sprache === "en" ? [{ wort: gefunden, art: "" }] : englischeStichwoerter(eintraege);
+      // Ist die Wortart klar, nur deren Bedeutungen und Tabellen benutzen
+      const art = wahl && wahl.filtern ? wahl.art : "";
+      const liste = sprache === "en" ? [{ wort: gefunden, art }]
+                  : englischeStichwoerter(art ? eintraege.filter(e => e.partOfSpeech === art) : eintraege);
       const stichwoerter = liste.map(x => x.wort);
       const [tabelle, rueck] = await Promise.all([
-        stichwoerter.length ? deutschUeberEnglisch(stichwoerter) : null,
+        stichwoerter.length ? deutschUeberEnglisch(stichwoerter, art) : null,
         rueckwaertsSuchen(gefunden, sprache),
       ]);
       if (tabelle) {
@@ -679,14 +825,16 @@
 
     // Tatoeba: echte Sätze von Freiwilligen, mit deutscher Übersetzung.
     // "=wort" sucht genau diese Wortform.
-    async function tatoebaBeispiel(woerter, sprache) {
+    async function tatoebaBeispiel(woerter, sprache, phrasen = []) {
       // Durchgang 1: genau diese Wortform ("=wort").
       // Durchgang 2: auch andere Formen ("bouquiner" -> "bouquine"), aber nur Sätze,
       // in denen ein Wort mit demselben Anfang vorkommt (Wort ohne den letzten Buchstaben).
-      const versuche = woerter.map(w => ({ wort: w, genau: true }));
+      // Durchgang 0: fertige Suchen, z. B. '"=the =building"' (Nomen mit Artikel)
+      const versuche = [...phrasen.map(p => ({ wort: p, genau: true, fertig: true })),
+                        ...woerter.map(w => ({ wort: w, genau: true }))];
       if (!woerter[0].includes(" ") && woerter[0].length >= 5) versuche.push({ wort: woerter[0], genau: false });
-      for (const { wort, genau } of versuche) {
-        const suche = wort.includes(" ") ? '"' + wort + '"' : (genau ? "=" : "") + wort;
+      for (const { wort, genau, fertig } of versuche) {
+        const suche = fertig ? wort : wort.includes(" ") ? '"' + wort + '"' : (genau ? "=" : "") + wort;
         let adresse = TATOEBA_ADRESSE + "&lang=" + TATOEBA_SPRACHE[sprache] + "&q=" + encodeURIComponent(suche);
         if (sprache !== "de") adresse += "&" + encodeURIComponent("trans:lang") + "=deu";
         const daten = await jsonHolen(adresse, false);
@@ -711,7 +859,11 @@
     // Sucht einen Beispielsatz in der Reihenfolge:
     // 1. de.wiktionary (mit deutscher Übersetzung), 2. Tatoeba,
     // 3. en.wiktionary-Satz + maschinelle deutsche Übersetzung (gekennzeichnet)
-    async function beispielFinden(gefunden, eingabe, sprache, eintraege, deEintrag) {
+    // Typische Artikel, um bei Nomen auch Sätze mit dem NOMEN zu finden
+    // ("the building" statt "What are they building?")
+    const SATZ_ARTIKEL = { en: ["the", "a"], fr: ["le", "la", "l'"], es: ["el", "la"] };
+
+    async function beispielFinden(gefunden, eingabe, sprache, eintraege, deEintrag, wahl) {
       const kurz = b => b.text.length <= 160;
       const deBeispiele = (deEintrag && deEintrag.beispiele) || [];
       if (sprache === "de") {
@@ -724,7 +876,15 @@
       }
 
       const formen = [...new Set([gefunden, eingabe.toLowerCase() === gefunden.toLowerCase() ? gefunden : eingabe])];
-      const tatoeba = await tatoebaBeispiel(formen, sprache);
+      // Nomen (Wortart klar): zuerst Sätze mit Artikel davor suchen
+      const phrasen = [];
+      if (wahl && wahl.filtern && wahl.art === "Noun" && SATZ_ARTIKEL[sprache]) {
+        const artikelListe = [...new Set([wahl.artikel, ...SATZ_ARTIKEL[sprache]].filter(Boolean))];
+        for (const a of artikelListe) {
+          phrasen.push(a.endsWith("'") ? '"=' + a + gefunden + '"' : '"=' + a + " =" + gefunden + '"');
+        }
+      }
+      const tatoeba = await tatoebaBeispiel(formen, sprache, phrasen.slice(0, 3));
       if (tatoeba) return tatoeba;
 
       if (sprache === "de" && deBeispiele.length) {      // Zitate nur als Notlösung (das kürzeste)
@@ -751,7 +911,7 @@
     // ---------------------------------------------------------------
     // Alles zusammen anzeigen
     // ---------------------------------------------------------------
-    async function ergebnisZeigen(gefunden, eingabe, sprache, eintraege, hinweise) {
+    async function ergebnisZeigen(gefunden, eingabe, sprache, eintraege, hinweise, wahl) {
       ergebnis.innerHTML = "";   // altes Ergebnis löschen
       ergebnis.appendChild(neuesElement("h2", "", gefunden + " (" + SPRACHEN[sprache] + ")"));
       const wortartZeile = neuesElement("div", "wortart", "");
@@ -792,7 +952,7 @@
       ergebnis.appendChild(klapp);
 
       // Deutsche Bedeutung zuerst (das Beispiel kann den de.wiktionary-Eintrag mitbenutzen)
-      const bedeutung = await deutscheBedeutungFinden(gefunden, eingabe, sprache, eintraege);
+      const bedeutung = await deutscheBedeutungFinden(gefunden, eingabe, sprache, eintraege, wahl);
       deInhalt.textContent = "";
       if (bedeutung.zeilen.length) {
         let letzteArt = null;
@@ -813,11 +973,13 @@
       }
 
       // Wortart auf Deutsch (aus de.wiktionary, sonst aus en.wiktionary übersetzt)
+      // (bei klarer Wortart diese, sonst die erste aus de.wiktionary bzw. en.wiktionary)
       const deArt = bedeutung.zeilen.find(z => z.wortart);
       const enArt = eintraege.find(e => e.partOfSpeech !== "Symbol");
-      wortartZeile.textContent = deArt ? deArt.wortart : (enArt ? wortartDeutsch(enArt.partOfSpeech) : "");
+      wortartZeile.textContent = wahl && wahl.filtern ? wortartDeutsch(wahl.art)
+        : (deArt ? deArt.wortart : (enArt ? wortartDeutsch(enArt.partOfSpeech) : ""));
 
-      const beispiel = await beispielFinden(gefunden, eingabe, sprache, eintraege, bedeutung.eintrag);
+      const beispiel = await beispielFinden(gefunden, eingabe, sprache, eintraege, bedeutung.eintrag, wahl);
       bspInhalt.textContent = "";
       if (beispiel) {
         bspInhalt.appendChild(neuesElement("div", "", beispiel.satz));
@@ -853,8 +1015,8 @@
       meldungZeigen("Einen Moment, ich schlage nach …", false);
 
       try {
-        const { gefunden, eintraege, hinweise } = await nachschlagen(wort, sprache);
-        await ergebnisZeigen(gefunden, wort, sprache, eintraege, hinweise);
+        const { gefunden, eintraege, hinweise, wahl } = await nachschlagen(wort, sprache);
+        await ergebnisZeigen(gefunden, wort, sprache, eintraege, hinweise, wahl);
       } catch (e) {
         if (e instanceof WortNichtGefunden)
           meldungZeigen("Das Wort „" + wort + "“ wurde auf " + SPRACHEN[sprache] + " nicht gefunden.", true);
