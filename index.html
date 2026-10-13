@@ -536,6 +536,152 @@
         .slice(0, 3);
     }
 
+    // ---------------------------------------------------------------
+    // Nichts gefunden? Dann helfen wir weiter:
+    // 1. andere Sprache (Französisch gewählt, Wort ist Englisch)
+    // 2. fehlendes Leerzeichen/Bindestrich ("casestudy" -> "case study")
+    // 3. Tippfehler: Vorschlag der Wiktionary-Suche ("Meintest du …?")
+    // ---------------------------------------------------------------
+    const SPRACH_REIHENFOLGE = ["en", "de", "fr", "es"];
+
+    // In welchen unserer Sprachen gibt es dieses Wort? (eine Anfrage pro Schreibweise)
+    async function sprachenDesWortes(wort) {
+      const gefunden = [];
+      const gross = wort.charAt(0).toUpperCase() + wort.slice(1);
+      for (const w of [...new Set([wort, wort.toLowerCase(), gross])]) {
+        try {
+          const daten = await datenHolen(w);
+          for (const s of SPRACH_REIHENFOLGE) if (daten[s] && !gefunden.includes(s)) gefunden.push(s);
+        } catch (e) {
+          if (!(e instanceof WortNichtGefunden)) throw e;
+        }
+      }
+      return gefunden;
+    }
+
+    // Versucht das Wort in den anderen Sprachen; gibt { sprache, ergebnis } oder null zurück
+    async function andereSpracheProbieren(wort, sprache) {
+      const sprachen = (await sprachenDesWortes(wort)).filter(s => s !== sprache);
+      for (const andere of sprachen) {
+        try {
+          const ergebnis = await nachschlagen(wort, andere);
+          if (!ergebnis.wortgruppe) return { sprache: andere, ergebnis };
+        } catch (e) {
+          if (!(e instanceof WortNichtGefunden)) throw e;
+        }
+      }
+      return null;
+    }
+
+    // "casestudy" -> ["case study", "case-study", "cases tudy", ...]; eine Anfrage für alle
+    async function zerlegungenFinden(wort) {
+      if (wort.includes(" ") || wort.length < 5 || wort.length > 30) return [];
+      const kandidaten = [];
+      for (let i = 2; i <= wort.length - 2; i++) {
+        kandidaten.push(wort.slice(0, i) + " " + wort.slice(i), wort.slice(0, i) + "-" + wort.slice(i));
+      }
+      const adresse = "https://en.wiktionary.org/w/api.php?action=query&format=json&formatversion=2&origin=*" +
+                      "&titles=" + encodeURIComponent(kandidaten.slice(0, 50).join("|"));
+      const daten = await jsonHolen(adresse);
+      const vorhanden = ((daten && daten.query && daten.query.pages) || [])
+        .filter(s => !s.missing && !s.invalid).map(s => s.title);
+      // Gleichmäßige Teilung zuerst ("case study" vor "cases tudy")
+      return kandidaten.filter(k => vorhanden.includes(k))
+        .sort((a, b) => Math.abs(a.split(/[ -]/)[0].length - wort.length / 2) -
+                        Math.abs(b.split(/[ -]/)[0].length - wort.length / 2));
+    }
+
+    // Tippfehler-Vorschlag der Wiktionary-Suche ("recieve" -> "receive")
+    async function vorschlagHolen(wort) {
+      const daten = await jsonHolen("https://en.wiktionary.org/w/api.php?action=query&list=search" +
+        "&srinfo=suggestion&srprop=&srlimit=1&format=json&origin=*&srsearch=" + encodeURIComponent(wort));
+      const v = daten && daten.query && daten.query.searchinfo && daten.query.searchinfo.suggestion;
+      if (v && v.toLowerCase() !== wort.toLowerCase()) return v;
+      // Kein Vorschlag? Unscharfe Suche ("Schmetterlink~" findet "Schmetterling"),
+      // aber nur, wenn höchstens 2 Buchstaben anders sind
+      const unscharf = await jsonHolen("https://en.wiktionary.org/w/api.php?action=query&list=search" +
+        "&srprop=&srlimit=3&format=json&origin=*&srsearch=" + encodeURIComponent(wort.replace(/[~"]/g, "") + "~"));
+      const titel = ((unscharf && unscharf.query && unscharf.query.search) || []).map(e => e.title);
+      return titel.find(t => t.toLowerCase() !== wort.toLowerCase() &&
+                             abstand(t.toLowerCase(), wort.toLowerCase()) <= 2) || null;
+    }
+
+    // Wie viele Buchstaben muss man ändern, um von a nach b zu kommen? (Levenshtein-Abstand)
+    function abstand(a, b) {
+      let zeile = Array.from({ length: b.length + 1 }, (_, i) => i);
+      for (let i = 1; i <= a.length; i++) {
+        const neu = [i];
+        for (let j = 1; j <= b.length; j++)
+          neu[j] = Math.min(zeile[j] + 1, neu[j - 1] + 1, zeile[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+        zeile = neu;
+      }
+      return zeile[b.length];
+    }
+
+    // Die ganze Suche mit allen Hilfen. Gibt { sprache, ergebnis, wechsel } zurück
+    // (wechsel = andere Sprache, auf die man umstellen kann) oder wirft WortNichtGefunden
+    // mit e.vorschlag (Tippfehler-Vorschlag).
+    async function suchenMitHilfe(wort, sprache) {
+      let ergebnis = null;
+      try {
+        ergebnis = await nachschlagen(wort, sprache);
+        // Gibt es das Wort in der gewählten Sprache nur als Name ("Haus" auf Englisch = Nachname)?
+        // Dann lieber die Sprache, in der es ein normales Wort ist.
+        const nurName = ergebnis.eintraege.length &&
+                        ergebnis.eintraege.every(e => e.partOfSpeech === "Proper noun");
+        // Zuerst klein geschrieben in derselben Sprache ("House" -> "house")
+        if (nurName && wort !== wort.toLowerCase()) {
+          try {
+            const klein = await nachschlagen(wort.toLowerCase(), sprache);
+            if (!klein.wortgruppe && !klein.eintraege.every(e => e.partOfSpeech === "Proper noun")) {
+              klein.hinweise.unshift("Eingegeben: „" + wort + "“ – gesucht: „" + wort.toLowerCase() + "“");
+              return { sprache, ergebnis: klein };
+            }
+          } catch (e) {
+            if (!(e instanceof WortNichtGefunden)) throw e;
+          }
+        }
+        if (nurName) {
+          const anders = await andereSpracheProbieren(wort, sprache);
+          if (anders && !anders.ergebnis.eintraege.every(e => e.partOfSpeech === "Proper noun")) {
+            anders.ergebnis.hinweise.unshift("Auf " + SPRACHEN[sprache] + " gibt es „" + wort +
+              "“ nur als Name – gefunden auf " + SPRACHEN[anders.sprache] + ".");
+            return { sprache: anders.sprache, ergebnis: anders.ergebnis, wechsel: anders.sprache };
+          }
+        }
+        if (!ergebnis.wortgruppe) return { sprache, ergebnis };
+      } catch (e) {
+        if (!(e instanceof WortNichtGefunden)) throw e;
+      }
+      // 1. andere Sprache (auch für Wortgruppen ohne Eintrag: "ice cream" mit Französisch)
+      const anders = await andereSpracheProbieren(wort, sprache);
+      if (anders) {
+        anders.ergebnis.hinweise.unshift("Auf " + SPRACHEN[sprache] + " nicht gefunden – gefunden auf " +
+                                         SPRACHEN[anders.sprache] + ".");
+        return { sprache: anders.sprache, ergebnis: anders.ergebnis, wechsel: anders.sprache };
+      }
+      if (ergebnis) return { sprache, ergebnis };      // Wortgruppe: ganze Gruppe übersetzen
+      // 2. Leerzeichen/Bindestrich fehlt? Zuerst in der gewählten Sprache, dann in den anderen
+      for (const teil of await zerlegungenFinden(wort)) {
+        const sprachen = await sprachenDesWortes(teil);
+        for (const s of [sprache, ...sprachen.filter(x => x !== sprache)]) {
+          if (!sprachen.includes(s)) continue;
+          try {
+            const e = await nachschlagen(teil, s);
+            e.hinweise.unshift("„" + wort + "“ nicht gefunden – gemeint ist wohl „" + teil + "“" +
+              (s !== sprache ? " (auf " + SPRACHEN[s] + ", nicht auf " + SPRACHEN[sprache] + ")" : "") + ".");
+            return { sprache: s, ergebnis: e, wechsel: s !== sprache ? s : null };
+          } catch (f) {
+            if (!(f instanceof WortNichtGefunden)) throw f;
+          }
+        }
+      }
+      // 3. Tippfehler-Vorschlag
+      const fehler = new WortNichtGefunden();
+      fehler.vorschlag = await vorschlagHolen(wort);
+      throw fehler;
+    }
+
     // Die ganze Suche: Artikel weg, Wortgruppe, Wörterbuchform der Gruppe, Grundform
     // Gibt zurück: { gefunden, eintraege, hinweise: [...] }
     // ---------------------------------------------------------------
@@ -551,6 +697,8 @@
       else if (/preterite|simple past|past tense|imperfect/.test(t)) teile.push("Vergangenheitsform");
       else if (/indicative|subjunctive|imperative|person/.test(t)) teile.push("gebeugte Verbform");
       if (/comparative/.test(t)) teile.push("Steigerungsform");
+      if (/misspelling/.test(t)) teile.push("Falschschreibung");
+      else if (/alternative (form|spelling)|nonstandard (form|spelling)/.test(t)) teile.push("andere Schreibweise");
       return teile.length ? teile.join(", ") : "gebeugte Form";
     }
 
@@ -635,7 +783,7 @@
       if (wahl && !verbNurForm) {
         // Hinweis "ist auch eine Form von" nur bei echten Beugungsformen einer ANDEREN Wortart
         // (also nicht bei "Alternative form of ..." und nicht "Essen" = Mehrzahl von "Esse")
-        if (form && form.grundform !== treffer.gefunden && form.beschreibung !== "gebeugte Form" &&
+        if (form && form.grundform !== treffer.gefunden && !["gebeugte Form", "andere Schreibweise", "Falschschreibung"].includes(form.beschreibung) &&
             form.art !== wahl.art) {
           const formArt = form.art === "Verb" || /Gerundium|Partizip|Verbform|Vergangenheit/.test(form.beschreibung)
             ? "Verb" : wortartDeutsch(form.art);
@@ -1261,13 +1409,24 @@
     // ---------------------------------------------------------------
     // Alles zusammen anzeigen
     // ---------------------------------------------------------------
-    async function ergebnisZeigen(gefunden, eingabe, sprache, eintraege, hinweise, wahl, wortgruppe) {
+    async function ergebnisZeigen(gefunden, eingabe, sprache, eintraege, hinweise, wahl, wortgruppe, wechsel) {
       ergebnis.innerHTML = "";   // altes Ergebnis löschen
       ergebnis.appendChild(neuesElement("h2", "", gefunden + " (" + SPRACHEN[sprache] + ")"));
       const wortartZeile = neuesElement("div", "wortart", "");
       ergebnis.appendChild(wortartZeile);
       // Hinweise, z. B. "Eingegeben: „la maison“ – gesucht: „maison“"
       for (const text of hinweise) ergebnis.appendChild(neuesElement("div", "hinweis", text));
+      // In einer anderen Sprache gefunden? Knopf, um die Sprachauswahl umzustellen
+      if (wechsel) {
+        const k = neuesElement("button", "einzelwort", "Sprache auf " + SPRACHEN[wechsel] + " umstellen");
+        k.type = "button";
+        k.addEventListener("click", () => {
+          spracheFeld.value = wechsel;
+          localStorage.setItem("sprache", wechsel);
+          k.remove();
+        });
+        ergebnis.appendChild(k);
+      }
 
       // Kasten 1: deutsche Bedeutung (Hauptteil)
       const deKasten = neuesElement("div", "deutsch");
@@ -1383,11 +1542,23 @@
       meldungZeigen("Einen Moment, ich schlage nach …", false);
 
       try {
-        const { gefunden, eintraege, hinweise, wahl, wortgruppe } = await nachschlagen(wort, sprache);
-        await ergebnisZeigen(gefunden, wort, sprache, eintraege, hinweise, wahl, wortgruppe);
+        const treffer = await suchenMitHilfe(wort, sprache);
+        const { gefunden, eintraege, hinweise, wahl, wortgruppe } = treffer.ergebnis;
+        await ergebnisZeigen(gefunden, wort, treffer.sprache, eintraege, hinweise, wahl, wortgruppe, treffer.wechsel);
       } catch (e) {
-        if (e instanceof WortNichtGefunden)
-          meldungZeigen("Das Wort „" + wort + "“ wurde auf " + SPRACHEN[sprache] + " nicht gefunden.", true);
+        if (e instanceof WortNichtGefunden) {
+          meldungZeigen("Das Wort „" + wort + "“ wurde auf " + SPRACHEN[sprache] + " nicht gefunden " +
+                        "(auch nicht in den anderen Sprachen).", true);
+          // Tippfehler? Vorschlag zum Antippen
+          if (e.vorschlag) {
+            const zeile = neuesElement("div", "einzelwoerter", "Meintest du ");
+            const k = neuesElement("button", "einzelwort", e.vorschlag);
+            k.type = "button";
+            k.addEventListener("click", () => { wortFeld.value = e.vorschlag; formular.requestSubmit(); });
+            zeile.append(k, "?");
+            ergebnis.appendChild(zeile);
+          }
+        }
         else if (e instanceof KeinInternet)
           meldungZeigen("Keine Verbindung zum Wörterbuch. Bitte Internet prüfen und nochmal versuchen." +
                         (e.message ? " (" + e.message + ")" : ""), true);
